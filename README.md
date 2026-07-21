@@ -1,5 +1,7 @@
 # perf-bench-loop
 
+English | **[简体中文](README.zh-CN.md)**
+
 A dual-ecosystem agent skill that runs [ASV (airspeed velocity)](https://asv.readthedocs.io/) benchmarks on a remote server to validate performance optimizations — designed to minimize the token waste that comes from letting a high-reasoning agent poll a multi-hour benchmark run.
 
 Works in both **Codex** and **ZCode / Claude Code**, since they share the [agentskills.io](https://agentskills.io) skill format.
