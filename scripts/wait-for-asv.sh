@@ -18,8 +18,10 @@
 #   wait-for-asv.sh --via <EXEC_PREFIX> --run-dir <RUN_DIR> [options]
 #
 # Required:
-#   --via EXEC_PREFIX      Quoted command prefix that reaches the machine
-#                          where ASV actually runs. Examples:
+#   --via EXEC_PREFIX      Command prefix that reaches the machine where ASV
+#                          actually runs, as a single string. It is split on
+#                          whitespace into an argv array (NOT eval'd), so no
+#                          shell metacharacters are interpreted. Examples:
 #                            "ssh <host>"
 #                            "ssh <host> docker exec -i <container>"
 #   --run-dir RUN_DIR      Absolute path on the ASV machine where
@@ -37,19 +39,12 @@
 #   EXIT_CODE:
 #   <integer exit code from ASV>
 #
-#   On success (done appeared), the script does NOT print the log. The main
-#   agent should use compare-asv.py for structured results, or dispatch the
-#   monitor subagent if it needs to read the raw log. Returning 300 lines of
-#   log on every run would waste tokens — that's exactly what the skill
-#   exists to prevent.
-#
 #   On wrapper death (pid gone but no done marker), prints:
 #   STATE: wrapper-died
 #
 # Exit status:
 #   0  Run finished normally (done appeared). Check printed EXIT_CODE for
-#      ASV's own status — it may be 0 (no change) or 1 (change detected by
-#      `asv continuous`), both are valid.
+#      ASV's own status.
 #   2  Run directory not found on the ASV machine.
 #   3  Timed out before `done` appeared.
 #   4  Wrapper process died (pid no longer alive) before `done` appeared.
@@ -64,10 +59,30 @@ timeout_secs=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --via)           via="$2"; shift 2 ;;
-        --run-dir)       run_dir="$2"; shift 2 ;;
-        --poll-interval) poll_interval="$2"; shift 2 ;;
-        --timeout)       timeout_secs="$2"; shift 2 ;;
+        --via)
+            if [ "$#" -lt 2 ]; then
+                echo "error: --via requires an argument" >&2
+                exit 64
+            fi
+            via="$2"; shift 2 ;;
+        --run-dir)
+            if [ "$#" -lt 2 ]; then
+                echo "error: --run-dir requires an argument" >&2
+                exit 64
+            fi
+            run_dir="$2"; shift 2 ;;
+        --poll-interval)
+            if [ "$#" -lt 2 ]; then
+                echo "error: --poll-interval requires an argument" >&2
+                exit 64
+            fi
+            poll_interval="$2"; shift 2 ;;
+        --timeout)
+            if [ "$#" -lt 2 ]; then
+                echo "error: --timeout requires an argument" >&2
+                exit 64
+            fi
+            timeout_secs="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
             exit 0 ;;
@@ -90,8 +105,23 @@ if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]]; then
     exit 64
 fi
 
+# Split --via into an argv array using read -ra. This is NOT eval — no shell
+# metacharacters are interpreted, no command substitution happens. The string
+# is simply split on whitespace into array elements, then passed as separate
+# argv entries to the command. This prevents injection via paths or arguments
+# containing quotes, $, backticks, etc.
+read -ra via_arr <<< "$via"
+
+# Build the timeout wrapper array if requested. Using an array (not a string)
+# so the timeout command and its argument are separate argv entries.
+timeout_arr=()
+if [ "$timeout_secs" -gt 0 ]; then
+    timeout_arr=(timeout "$timeout_secs")
+fi
+
 # Validate the run directory exists ON THE ASV MACHINE.
-if ! eval "$via test -d '$run_dir'"; then
+# Uses the argv array — no eval, no string concatenation.
+if ! "${via_arr[@]}" test -d "$run_dir"; then
     echo "error: run directory not found on the ASV machine: $run_dir" >&2
     echo "  (checked via: $via)" >&2
     echo "  If ASV runs in a container, --run-dir must be the path INSIDE the container," >&2
@@ -99,46 +129,41 @@ if ! eval "$via test -d '$run_dir'"; then
     exit 2
 fi
 
-# Build the timeout wrapper if requested.
-timeout_cmd=""
-if [ "$timeout_secs" -gt 0 ]; then
-    timeout_cmd="timeout ${timeout_secs}"
-fi
-
-# Single call to the ASV machine. The remote shell:
+# Single call to the ASV machine. The remote shell script is passed via
+# heredoc with QUOTED delimiter (<<'REMOTE') so NO local variable expansion
+# happens inside it — the script is literal text. Parameters (run_dir,
+# poll_interval) are passed as argv to the remote bash via -- "$run_dir"
+# "$poll_interval", which is safe against injection.
+#
+# The remote script:
 #   1. Loops checking for `done` AND pid liveness simultaneously.
 #   2. If done appears → success, print exit code.
 #   3. If pid dies before done → wrapper-died, exit 4.
 #   4. If timeout fires → exit 124 (converted to 3 below).
-#
-# Silence during the wait is intentional — output wakes the main agent.
-# We use a subshell + kill 0 pattern to ensure the sleep is cleaned up on
-# timeout. The remote script captures its own exit code so we can
-# distinguish timeout (124) from normal completion.
 set +e
-eval "$via $timeout_cmd bash -s" <<REMOTE
-run_dir="$run_dir"
-poll_interval="$poll_interval"
+"${via_arr[@]}" "${timeout_arr[@]}" bash -s -- "$run_dir" "$poll_interval" <<'REMOTE'
+run_dir="$1"
+poll_interval="$2"
 
-while [ ! -f "\$run_dir/done" ]; do
+while [ ! -f "$run_dir/done" ]; do
     # Check if the wrapper process is still alive. If it died without
     # writing `done`, something killed it (container restart, OOM, kill).
-    pid_file="\$run_dir/pid"
-    if [ -f "\$pid_file" ]; then
-        pid=\$(cat "\$pid_file" 2>/dev/null)
-        if [ -n "\$pid" ] && ! kill -0 "\$pid" 2>/dev/null; then
+    pid_file="$run_dir/pid"
+    if [ -f "$pid_file" ]; then
+        pid=$(cat "$pid_file" 2>/dev/null)
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
             echo "STATE: wrapper-died"
-            echo "PID: \$pid"
+            echo "PID: $pid"
             exit 4
         fi
     fi
-    sleep "\$poll_interval"
+    sleep "$poll_interval"
 done
 
 echo "RUN_DIR:"
-echo "\$run_dir"
+echo "$run_dir"
 echo "EXIT_CODE:"
-cat "\$run_dir/exit_code" 2>/dev/null || echo "unknown"
+cat "$run_dir/exit_code" 2>/dev/null || echo "unknown"
 exit 0
 REMOTE
 rc=$?

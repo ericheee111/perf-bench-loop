@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 from dataclasses import dataclass, field
@@ -388,6 +389,12 @@ def classify_case(
         # One side failed — can't compare.
         return "NOT_COMPARABLE", None
     if baseline <= 0:
+        return "NOT_COMPARABLE", None
+
+    # Guard against NaN / Inf. Without this, NaN > threshold is False and
+    # NaN < -threshold is also False, so NaN would silently fall through to
+    # PASS — a false positive. math.isfinite rejects both NaN and Inf.
+    if not math.isfinite(baseline) or not math.isfinite(candidate):
         return "NOT_COMPARABLE", None
 
     ratio = candidate / baseline

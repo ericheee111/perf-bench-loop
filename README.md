@@ -38,16 +38,21 @@ Result: token cost of waiting drops from "hours of high-reasoning polling" to "o
 
 ## Installation
 
-This skill follows the standard agentskills.io layout. Drop the `perf-bench-loop/` directory into any of:
+This skill follows the standard agentskills.io layout. The skill directory (`perf-bench-loop/`) goes into a skills discovery path:
 
-- `<project>/.agents/skills/` — project-local
-- `~/.agents/skills/` — user-global (this is where it lives on the author's machine)
+| Client | Project-level | User-level |
+|---|---|---|
+| Codex | `<project>/.agents/skills/` | `~/.agents/skills/` |
+| ZCode | `<project>/.agents/skills/` | `~/.agents/skills/` |
+| Claude Code | `<project>/.claude/skills/` | `~/.claude/skills/` |
 
-Both Codex and ZCode/Claude Code auto-discover skills from these paths.
+For cross-client use, install in both `.agents/skills/` and `.claude/skills/`, or use a symlink pointing to one canonical copy.
+
+**The helper scripts** (`asv-background.sh`, `wait-for-asv.sh`) should be deployed to a **fixed path outside the project source tree** on the benchmark machine (e.g. `~/.local/share/perf-bench-loop/`), not committed into the project. This avoids polluting `git status`, especially for forks of upstream projects. See SKILL.md Phase 1 "First-run setup" for details.
 
 ### Codex additional setup
 
-On first use in a Codex project, also drop the toml from [`references/codex-setup.md`](references/codex-setup.md) into `.codex/agents/asv-monitor.toml`. This pins the log-reading subagent to a lightweight model + read-only sandbox so Codex doesn't default to a flagship model for log reading.
+On first use in a Codex environment, also drop the toml from [`references/codex-setup.md`](references/codex-setup.md) into `~/.codex/agents/asv-monitor.toml` (user-global) or `<project>/.codex/agents/asv-monitor.toml` (project-local). This pins the log-reading subagent to a lightweight model + read-only sandbox so Codex doesn't default to a flagship model for log reading.
 
 ZCode/Claude Code needs no such file — the main agent dispatches the subagent with `model: "haiku"` directly at call time.
 

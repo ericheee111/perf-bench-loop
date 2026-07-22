@@ -1,6 +1,6 @@
 ---
 name: perf-bench-loop
-description: Run performance benchmarks and validation suites on a remote server to validate optimizations, auto-generate before/after comparison, and optionally iterate on code changes until no regression. Currently supports ASV (airspeed velocity); designed to extend to other remote validation (pytest, etc.). Use whenever the user mentions asv, airspeed velocity, benchmarking a perf change, checking for performance regressions, validating an optimization, running tests on a remote server, or asks to "run asv", "跑基准", "性能优化验证", "看看有没有回归", "跑测试". Covers both one-shot validation and automatic fix-until-pass loops.
+description: Run long-running ASV (airspeed velocity) benchmarks on a remote server to validate performance optimizations, wait without agent polling, and compare a baseline commit with a candidate commit. Use only when the task explicitly involves ASV, airspeed velocity, or an ASV performance regression check. Do not use for generic pytest, remote tests, or arbitrary remote commands. Covers both one-shot validation and automatic fix-until-pass loops (max 3 iterations).
 ---
 
 # Perf Bench Loop
@@ -67,7 +67,7 @@ Gather the following before touching anything. Don't guess any of it — every m
 2. **Remote project root** — where the benchmark config lives on the benchmark machine (e.g. `asv.conf.json` for ASV). Ask if unclear.
 3. **Container or other hop (if any)** — does the benchmark run directly on the SSH host, or inside a container / another environment? If there's an intermediate hop (e.g. `docker exec <container>`), you need the full command chain that reaches the benchmark machine. Ask the user; don't assume.
 4. **Environment activation (if any)** — does the benchmark tool need a conda env, virtualenv, module load, or other activation before it's on PATH? If so, get the exact activation command. `docker exec` defaults to a non-login shell, so conda hooks won't load automatically — the activation command must be explicit.
-5. **Benchmark command** — the subcommand and flags. For ASV, e.g. `run --quick`, `continuous --factor 1.05 <base> HEAD`, `run --branch=HEAD`. Ask the user every time. `asv-background.sh` currently prepends `asv` itself, so pass only the ASV subcommand and flags.
+5. **Benchmark command** — the subcommand and flags. For ASV, e.g. `continuous --factor 1.05 <base> HEAD`, `run --branch=HEAD`. Ask the user every time. `asv-background.sh` currently prepends `asv` itself, so pass only the ASV subcommand and flags. **Do not use `--quick`** for runs whose results you want to compare — ASV does not save results from quick runs, so compare-asv.py will find nothing. Use `--quick` only for early smoke testing (does the benchmark even run without errors?).
 6. **Local test command** — what to run locally for the fast gate in Phase 2. Ask if not obvious from the project (`pytest -x` is a reasonable default for Python projects; never assume).
 
 **First-run setup:** the skill's scripts (`asv-background.sh`, `wait-for-asv.sh`) need to be accessible on the benchmark machine. Deploy them to a **fixed location outside the project source tree** (e.g. `~/.local/share/perf-bench-loop/` or `/home/<user>/tools/perf-bench-loop/` on the benchmark machine), not inside the project's `scripts/` directory. This avoids polluting the project's `git status` — especially important for forks of upstream projects where stray files complicate PRs. Use `scp` or `rsync` to push them, `chmod +x`, and record the deployment path for use in Phase 3.
@@ -83,7 +83,7 @@ Optional: write `.perf-bench-loop/host` in the project root so future sessions s
 Main agent work, high reasoning.
 
 1. Make the optimization the user asked for.
-2. Run the **local fast test** (from Phase 1.4) before any ASV involvement. This is seconds-to-minutes and catches the bulk of silly mistakes — a broken import, a wrong signature, a test that doesn't even pass functionally. ASV is hours-level; don't waste a server run on code that fails `pytest`.
+2. Run the **local fast test** (from Phase 1, item 6) before any ASV involvement. This is seconds-to-minutes and catches the bulk of silly mistakes — a broken import, a wrong signature, a test that doesn't even pass functionally. ASV is hours-level; don't waste a server run on code that fails `pytest`.
 3. If the fast test fails, fix it and re-run. Do not proceed to Phase 3 until local tests are green.
 
 ### Phase 3 — Launch the remote ASV run
@@ -113,7 +113,8 @@ Goal: start ASV in the background on the server and return immediately. Do not w
 
    The `bash -lc` + env-activation wrapper is needed when the exec target (e.g. `docker exec`) defaults to a non-login shell that doesn't load env hooks. If there's no env activation, drop that wrapper and run the script directly.
 4. Record two things: the **run directory path as the ASV machine sees it** (for Phase 4/5 `--run-dir`), and the **exec prefix for reaching the ASV machine's filesystem** (for Phase 4 `--via` — this does *not* include env activation, since waiting only does file operations).
-5. Verify the launch took: `eval "$EXEC_PREFIX test -f '$RUN_DIR/pid'"` should succeed. If the pid file isn't there within a few seconds, the launch failed — do not proceed to waiting.
+5. **Verify the remote HEAD matches the candidate commit.** This is critical: if the remote repo hasn't pulled your latest changes, ASV will benchmark the wrong code and produce a misleading comparison. Run: `<exec-prefix> bash -lc "cd <remote-project-root> && git rev-parse HEAD"` and confirm it matches the candidate commit hash you expect. If it doesn't match, stop and tell the user — the remote needs to be updated (git fetch/checkout/pull) before running ASV.
+6. Verify the launch took: use the exec prefix (without `eval`) to check the pid file exists. For example: `ssh <host> docker exec <container> test -f <run-dir>/pid` should succeed within a few seconds. If not, the launch failed — do not proceed to waiting.
 
 You're now done for this phase. The ASV run is running detached.
 
