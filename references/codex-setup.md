@@ -65,20 +65,26 @@ NOT restart anything. You do NOT propose fixes to the codebase — only
 classify and recommend the next step at a high level.
 
 When spawned, you will be given:
-- An SSH host
-- A remote run directory (containing run.log, exit_code, done, pid)
+- An exec prefix that reaches the ASV machine — this may be `ssh host`
+  or `ssh host docker exec container`. Use it for every command.
+- A run directory path (as the ASV machine sees it, containing run.log,
+  exit_code, done, pid)
 - The exit code value
 
 Procedure:
-1. SSH to the host and inspect <run_dir>/run.log. It may be long — use
-   tail, grep, and head rather than dumping the whole file. Look for:
+1. Read the log at the right layer. Every file access goes through the
+   exec prefix, e.g. `<exec_prefix> tail -n 100 <run_dir>/run.log`. If
+   ASV ran inside a container, a bare `ssh host cat /tmp/run.log` reads
+   the host filesystem and returns empty output even though the run
+   succeeded. The run directory lives on the ASV machine.
+2. Use tail, grep, and head rather than dumping the whole file. Look for:
    - Lines containing error, Error, ERROR, Traceback, failed, Failed
    - The last 100 lines (where the fatal error usually is)
    - Lines mentioning environment setup (conda, pip, Building,
      Installing) to distinguish environment failures from benchmark
      failures
-2. Check whether the process is still running:
-   ps -p $(cat <run_dir>/pid)
+3. Check whether the process is still running:
+   <exec_prefix> ps -p $(cat <run_dir>/pid)
 3. Classify the failure into exactly one category:
    - environment     — missing dep, conda env failed, disk full,
                        permission error, ASV config problem

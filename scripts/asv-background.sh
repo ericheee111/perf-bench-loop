@@ -1,26 +1,31 @@
 #!/usr/bin/env bash
 #
-# asv-background.sh — Launch an ASV run in the background on the server.
+# asv-background.sh — Launch an ASV run in the background, write status files
+# to a stable run directory, and return immediately.
 #
-# Writes a stable run directory so other tools (wait-for-asv.sh, compare-asv.py)
-# know exactly where to look. The run is detached with nohup; this script
-# returns immediately after launching.
+# This script runs ON THE SAME MACHINE AS ASV (i.e. inside the container if
+# you use containers). It does NOT handle ssh or docker exec itself — the
+# caller wraps it. See SKILL.md Phase 3 for the wrapping pattern.
 #
 # Usage:
 #   asv-background.sh <RUN_DIR> <ASV_CMD...>
 #
 # Arguments:
 #   RUN_DIR    Directory to create for this run. Will be created if missing.
-#              Typically a relative path under the project root, e.g.
-#              .asv-runs/20260721-143000
+#              MUST be on a filesystem visible to the ASV process — i.e. if
+#              ASV runs inside a container, RUN_DIR must be a path inside
+#              that container (typically a bind-mount if you want the host
+#              to see the files too). A relative path is resolved against
+#              $PWD at launch time.
 #   ASV_CMD... The ASV command and its arguments to run, e.g.
-#              `asv run --quick` or `asv run --branch=HEAD`.
+#              `run --quick` or `run --branch=HEAD`. The leading `asv` is
+#              added by this script — pass only the subcommand and flags.
 #
 # Files written to RUN_DIR:
 #   pid         PID of the background ASV process (written immediately)
 #   run.log     Full stdout+stderr of the ASV command
 #   exit_code   Exit code of the ASV command (written when run finishes)
-#   done        Empty marker file, touched when run finishes
+#   done        Empty marker file, touched when run finishes (atomic signal)
 #
 # Output:
 #   Prints the absolute path of RUN_DIR on stdout. Nothing else on stdout.
@@ -28,12 +33,16 @@
 #
 # Exit status:
 #   0 if the background job was launched successfully.
-#   Non-zero if RUN_DIR is missing or the launch failed.
+#   64 on usage error.
+#   Non-zero if the launch failed.
 #
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
     echo "usage: asv-background.sh <RUN_DIR> <ASV_CMD...>" >&2
+    echo "" >&2
+    echo "RUN_DIR must be on a filesystem visible to the ASV process." >&2
+    echo "If ASV runs in a container, RUN_DIR must be inside that container." >&2
     exit 64
 fi
 
@@ -52,8 +61,13 @@ mkdir -p "$abs_run_dir"
 
 # Launch ASV detached. The inner bash:
 #   - disables errexit for the ASV call so we always capture the exit code
+#   - redirects asv stdout+stderr into run.log INSIDE run_dir (same fs layer
+#     as the ASV process, so the write always lands even in a container)
 #   - writes exit_code and touches done regardless of success/failure
-#   - the marker file is the signal wait-for-asv.sh is blocking on
+#   - the `done` marker is the atomic signal wait-for-asv.sh blocks on
+#
+# Why the writes are ordered run.log -> exit_code -> done: a reader polling
+# for `done` is guaranteed that run.log and exit_code are already flushed.
 nohup bash -c '
     set +e
     run_dir="$1"
