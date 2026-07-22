@@ -68,7 +68,9 @@ Gather four pieces of information before touching anything. Don't guess any of t
 3. **ASV command** — ask the user every time, even if you think you remember. Default suggestion is `asv run`, but projects often use `asv run --quick`, `asv run --branch=HEAD`, or a wrapper like `make bench`. Confirm the exact command.
 4. **Local test command** — what to run locally for the fast gate in Phase 2. Ask if not obvious from the project (`pytest -x` is a reasonable default for Python projects; never assume).
 
-**First-run setup:** if the remote project doesn't already have `scripts/asv-background.sh` and `scripts/wait-for-asv.sh`, copy them from this skill's `scripts/` directory into the project's `scripts/` folder and commit them. They are meant to live with the project so the run directory layout is stable across sessions. Use `scp` or `rsync` to push them, then `chmod +x`.
+**First-run setup:** if the remote project doesn't already have `scripts/asv-background.sh` and `scripts/wait-for-asv.sh`, copy them from this skill's `scripts/` directory into the project's `scripts/` folder and commit them. They are meant to live with the project so the run-directory layout is stable across sessions. Use `scp` or `rsync` to push them, then `chmod +x`.
+
+**Line endings matter.** If you edit or copy these scripts on Windows, they may end up with CRLF (`\r\n`) line endings. Linux containers will fail with `env: 'bash\r': No such file or directory` — the `\r` breaks the shebang. After pushing to a Linux target, convert with `sed -i 's/\r$//' scripts/asv-background.sh scripts/wait-for-asv.sh` (run inside the container), or push via `scp` from a source that already has LF endings. Verify with `head -1 scripts/asv-background.sh | od -c | tail -1` — the line should end in `\n`, not `\r \n`.
 
 Optional: write `.asv-codex/host` in the project root so future sessions skip step 1's question.
 
@@ -89,6 +91,7 @@ Goal: start ASV in the background on the server and return immediately. Do not w
 1. Decide the **exec prefix** — the command chain that reaches the machine where ASV actually runs. This is the single most important decision in the whole workflow, because every later phase reuses it.
     - **Direct SSH**: `ssh bench01`
     - **SSH + container**: `ssh kpserver docker exec <container>` (ASV runs inside `<container>`, the run directory must be a path visible inside that container — typically a bind-mount like `/tmp/asv-runs/...`)
+    - **SSH + container + conda**: if ASV lives in a conda env inside the container, the conda activation belongs in the *launch* command (Phase 3), not in `--via` (Phase 4). `--via` only needs to reach the container's filesystem for waiting/reading files; conda is only needed to run `asv` itself.
 2. Pick a run directory name: `<remote-project-root>/.asv-runs/<YYYYMMDD-HHMMSS>`. This path must be valid **on the ASV machine** (inside the container if you use one).
 3. Launch via the background script, wrapped in your exec prefix:
 
@@ -97,14 +100,15 @@ Goal: start ASV in the background on the server and return immediately. Do not w
    ssh <host> 'cd <remote-project-root> && ./scripts/asv-background.sh \
      ".asv-runs/<timestamp>" <asv-subcommand-and-flags...>'
 
-   # SSH + container (run dir must be inside the container)
-   ssh kpserver 'docker exec <container> bash -c \
-     "cd <project-root-in-container> && ./scripts/asv-background.sh \
-       /tmp/asv-runs/<timestamp> <asv-subcommand-and-flags...>"'
+   # SSH + container + conda (verified working example)
+   ssh kpserver "docker exec knumpy-920b-baseline bash -lc \
+     'conda activate h00932740 && cd /home/h00932740/pandas/asv_bench && \
+      ./scripts/asv-background.sh /home/h00932740/pandas/asv_bench/.asv-runs/<timestamp> \
+      run --quick'"
    ```
 
-   Note: `asv-background.sh` prepends `asv` itself, so pass the subcommand and flags (e.g. `run --quick`), not `asv run --quick`.
-4. Record two things: the **run directory path as the ASV machine sees it** (for Phase 4/5 `--run-dir`), and the **exec prefix** (for Phase 4 `--via`).
+   Note: `asv-background.sh` prepends `asv` itself, so pass the subcommand and flags (e.g. `run --quick`), not `asv run --quick`. The `bash -lc` + `conda activate` wrapper is needed because `docker exec` defaults to a non-login shell that doesn't load conda hooks.
+4. Record two things: the **run directory path as the ASV machine sees it** (for Phase 4/5 `--run-dir`), and the **exec prefix for reaching the container's filesystem** (for Phase 4 `--via` — this does *not* include conda, since waiting only does file operations).
 5. Verify the launch took: `eval "$EXEC_PREFIX test -f '$RUN_DIR/pid'"` should succeed. If the pid file isn't there within a few seconds, the launch failed — do not proceed to waiting.
 
 You're now done for this phase. The ASV run is running detached.
@@ -128,10 +132,12 @@ Examples:
 # Direct SSH
 ./scripts/wait-for-asv.sh --via 'ssh bench01' --run-dir '/srv/proj/.asv-runs/20260721-143000'
 
-# SSH + container
-./scripts/wait-for-asv.sh --via 'ssh kpserver docker exec erichee-cpu200-203' \
-  --run-dir '/tmp/asv-runs/20260721-143000'
+# SSH + container (verified working — note the -i, required for stdin/heredoc passthrough)
+./scripts/wait-for-asv.sh --via 'ssh kpserver docker exec -i knumpy-920b-baseline' \
+  --run-dir '/home/h00932740/pandas/asv_bench/.asv-runs/20260721-143000'
 ```
+
+The `-i` on `docker exec` is not optional in the container case: `wait-for-asv.sh` feeds its wait-loop script via a heredoc on stdin, and without `-i` docker exec won't read stdin, so the loop never starts and the command hangs. Conda is not in `--via` because the wait loop only does `test`/`cat`/`tail` on files — no need for the ASV environment.
 
 What this does: the exec prefix reaches the ASV machine, where a shell loop `while [ ! -f done ]; do sleep 90; done` blocks. When `done` appears, it prints `EXIT_CODE:` + the exit code and `FINAL_LOG:` + the last 300 lines of `run.log`. One tool call, regardless of whether ASV took 5 minutes or 5 hours.
 
