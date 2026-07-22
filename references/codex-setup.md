@@ -44,12 +44,13 @@ low-cost pass over the run log to classify a failure. Do not use this
 agent for code changes or for interpreting successful benchmark results.
 """
 
-# Lightweight model. Replace with whatever cheap tier your account has
-# access to (e.g. gpt-5.4-mini, gpt-5.6-terra, or a mini variant). The
-# point is: this agent reads a log and returns a 200-word summary. It
-# does not need high reasoning. Do not set this to a flagship model —
-# that defeats the entire purpose of the skill.
-model = "gpt-5.4-mini"
+# Lightweight model. REPLACE THIS with whatever cheap tier your Codex
+# account has access to (a mini / fast / low-cost variant). The point is:
+# this agent reads a log and returns a 200-word summary. It does not need
+# high reasoning. Do not set this to a flagship model — that defeats the
+# entire purpose of the skill. Ask the user which lightweight model to use
+# if you're unsure what's available.
+model = "<lightweight-model>"
 model_reasoning_effort = "low"
 
 # Read-only: the monitor must not modify source, the run directory, or
@@ -113,7 +114,7 @@ and set CATEGORY to unknown.
 ## Notes on the fields
 
 - `name = "asv_monitor"` — must match what the main agent spawns. The skill instructions refer to `asv_monitor` by this exact name.
-- `model` — pick whatever lightweight model your Codex account has access to. The literal `gpt-5.4-mini` is a reasonable default at time of writing; substitute if your account uses different model names. **Do not** set this to a flagship/high-reasoning model — that defeats the skill's purpose.
+- `model` — **must be replaced** with a lightweight model your Codex account has access to. Ask the user which cheap/fast model to use if unsure. **Do not** set this to a flagship/high-reasoning model — that defeats the skill's purpose.
 - `model_reasoning_effort = "low"` — log classification doesn't need deep reasoning. Keep this low.
 - `sandbox_mode = "read-only"` — the monitor only reads. This is a safety net: even if the monitor hallucinated a desire to "fix" something, it can't.
 - `developer_instructions` — this is the full prompt. It's a self-contained version of `references/monitor-prompt.md` so the subagent doesn't need to load any extra files. If you edit one, keep the other in sync.

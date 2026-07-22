@@ -13,8 +13,8 @@
 # Required:
 #   --via EXEC_PREFIX      Quoted command prefix that reaches the machine
 #                          where ASV actually runs. Examples:
-#                            "ssh bench01"
-#                            "ssh kpserver docker exec container"
+#                            "ssh <host>"
+#                            "ssh <host> docker exec -i <container>"
 #                          Everything after the prefix runs ON the ASV
 #                          machine. The prefix is split with eval, so quote
 #                          arguments that contain spaces.
@@ -70,7 +70,7 @@ done
 
 if [ -z "$via" ] || [ -z "$run_dir" ]; then
     echo "usage: wait-for-asv.sh --via <EXEC_PREFIX> --run-dir <RUN_DIR> [--poll-interval SECS] [--timeout SECS]" >&2
-    echo '  --via "ssh bench01"  or  --via "ssh kpserver docker exec container"' >&2
+    echo '  --via "ssh <host>"  or  --via "ssh <host> docker exec -i <container>"' >&2
     exit 64
 fi
 
