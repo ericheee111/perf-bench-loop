@@ -1,28 +1,3 @@
-# OS / editor
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-*~
-.vscode/
-.idea/
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-.pytest_cache/
-.venv/
-venv/
-
-# Local test artifacts (from developing the skill itself)
-/tmp/
-*.log
-.asv-runs/
-.asv/
-
-# Don't commit user-specific skill install paths or secrets
-.env
-.env.local
-.asv-codex/host
+# Test artifacts (Windows temp paths accidentally created by tests)
+C:/
