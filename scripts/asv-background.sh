@@ -59,6 +59,17 @@ esac
 
 mkdir -p "$abs_run_dir"
 
+# Refuse to reuse a non-empty run directory. A stale `done` marker from a
+# previous run would make wait-for-asv.sh return immediately with the old
+# result. Don't auto-delete — the directory might belong to a still-running
+# job. Error out and let the caller pick a new timestamp.
+if [ -n "$(ls -A "$abs_run_dir" 2>/dev/null)" ]; then
+    echo "error: run directory is not empty: $abs_run_dir" >&2
+    echo "  This usually means a timestamp collision or a reused path." >&2
+    echo "  Pick a new run directory with a unique timestamp." >&2
+    exit 1
+fi
+
 # Launch ASV detached. The inner bash:
 #   - disables errexit for the ASV call so we always capture the exit code
 #   - redirects asv stdout+stderr into run.log INSIDE run_dir (same fs layer

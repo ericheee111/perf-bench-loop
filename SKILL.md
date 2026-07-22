@@ -70,9 +70,11 @@ Gather the following before touching anything. Don't guess any of it — every m
 5. **ASV command** — the subcommand and flags, e.g. `run --quick`, `continuous --factor 1.05 <base> HEAD`, `run --branch=HEAD`. Ask the user every time. `asv-background.sh` prepends `asv` itself, so pass only the subcommand and flags.
 6. **Local test command** — what to run locally for the fast gate in Phase 2. Ask if not obvious from the project (`pytest -x` is a reasonable default for Python projects; never assume).
 
-**First-run setup:** if the remote project doesn't already have `scripts/asv-background.sh` and `scripts/wait-for-asv.sh`, copy them from this skill's `scripts/` directory into the project's `scripts/` folder and commit them. They are meant to live with the project so the run-directory layout is stable across sessions. Use `scp` or `rsync` to push them, then `chmod +x`.
+**First-run setup:** the skill's scripts (`asv-background.sh`, `wait-for-asv.sh`) need to be accessible on the ASV machine. Deploy them to a **fixed location outside the project source tree** (e.g. `~/.local/share/perf-bench-loop/` or `/home/<user>/tools/perf-bench-loop/` on the ASV machine), not inside the project's `scripts/` directory. This avoids polluting the project's `git status` — especially important for forks of upstream projects where stray files complicate PRs. Use `scp` or `rsync` to push them, `chmod +x`, and record the deployment path for use in Phase 3.
 
-**Line endings matter.** If you edit or copy these scripts on Windows, they may end up with CRLF (`\r\n`) line endings. Linux containers will fail with `env: 'bash\r': No such file or directory` — the `\r` breaks the shebang. After pushing to a Linux target, convert with `sed -i 's/\r$//' scripts/asv-background.sh scripts/wait-for-asv.sh` (run inside the container), or push via `scp` from a source that already has LF endings. Verify with `head -1 scripts/asv-background.sh | od -c | tail -1` — the line should end in `\n`, not `\r \n`.
+Run directories should also live outside the project tree (e.g. `/home/<user>/asv-runs/<timestamp>`), for the same reason.
+
+**Line endings matter.** If you edit or copy these scripts on Windows, they may end up with CRLF (`\r\n`) line endings. Linux containers will fail with `env: 'bash\r': No such file or directory` — the `\r` breaks the shebang. After pushing to a Linux target, convert with `sed -i 's/\r$//'` on each script (run on the ASV machine), or push via `scp` from a source that already has LF endings. Verify with `head -1 <script> | od -c | tail -1` — the line should end in `\n`, not `\r \n`.
 
 Optional: write `.asv-codex/host` in the project root so future sessions skip step 1's question.
 
@@ -94,18 +96,18 @@ Goal: start ASV in the background on the server and return immediately. Do not w
     - **Direct SSH**: `ssh <ssh-host>`
     - **SSH + container**: `ssh <ssh-host> docker exec -i <container>` (ASV runs inside `<container>`; the run directory must be a path visible inside that container)
     - **SSH + container + env activation**: if ASV needs a conda env / virtualenv, the activation belongs in the *launch* command (Phase 3), not in `--via` (Phase 4). `--via` only needs to reach the container's filesystem for waiting/reading files; the env is only needed to run `asv` itself.
-2. Pick a run directory name: `<remote-project-root>/.asv-runs/<YYYYMMDD-HHMMSS>`. This path must be valid **on the ASV machine** (inside the container if you use one).
-3. Launch via the background script, wrapped in your exec prefix:
+2. Pick a run directory path **outside the project source tree** (see Phase 1 first-run setup), e.g. `<asv-runs-root>/<YYYYMMDD-HHMMSS>`. This path must be valid **on the ASV machine** (inside the container if you use one).
+3. Launch via the background script, wrapped in your exec prefix. Use the deployment path from Phase 1 (not a project-relative path):
 
    ```bash
    # Direct SSH
-   ssh <ssh-host> 'cd <remote-project-root> && ./scripts/asv-background.sh \
-     ".asv-runs/<timestamp>" <asv-subcommand-and-flags...>'
+   ssh <ssh-host> 'cd <remote-project-root> && <script-deploy-path>/asv-background.sh \
+     "<asv-runs-root>/<timestamp>" <asv-subcommand-and-flags...>'
 
    # SSH + container + env activation
    ssh <ssh-host> "docker exec <container> bash -lc \
      '<env-activation> && cd <remote-project-root> && \
-      ./scripts/asv-background.sh <remote-project-root>/.asv-runs/<timestamp> \
+      <script-deploy-path>/asv-background.sh <asv-runs-root>/<timestamp> \
       <asv-subcommand-and-flags...>'"
    ```
 
@@ -142,7 +144,9 @@ Examples:
 
 The `-i` on `docker exec` is not optional in the container case: `wait-for-asv.sh` feeds its wait-loop script via a heredoc on stdin, and without `-i` docker exec won't read stdin, so the loop never starts and the command hangs. Env activation (conda etc.) is not in `--via` because the wait loop only does `test`/`cat`/`tail` on files — no need for the ASV environment.
 
-What this does: the exec prefix reaches the ASV machine, where a shell loop `while [ ! -f done ]; do sleep 90; done` blocks. When `done` appears, it prints `EXIT_CODE:` + the exit code and `FINAL_LOG:` + the last 300 lines of `run.log`. One tool call, regardless of whether ASV took 5 minutes or 5 hours.
+What this does: the exec prefix reaches the ASV machine, where a shell loop blocks on the `done` marker (and simultaneously checks pid liveness — if the wrapper process dies without writing `done`, it returns `STATE: wrapper-died` immediately instead of hanging forever). When `done` appears, it prints `RUN_DIR:` + the path and `EXIT_CODE:` + the ASV exit code. It does **not** print the log — the main agent uses `compare-asv.py` for structured results, or dispatches the monitor subagent if it needs the raw log. Returning 300 lines of log on every run would waste tokens.
+
+The ASV exit code is passed through as-is. This matters: `asv continuous` returns exit 1 when it detects a performance change — that is a **valid result**, not a failure. Don't treat exit 1 from ASV as "something went wrong." The script's own exit codes are: 0 = run finished (check the printed ASV exit code for its meaning), 2 = run dir not found, 3 = timed out, 4 = wrapper died.
 
 The `--via` redesign is deliberate. The previous version took a bare `SSH_HOST` and ran the wait loop on the ssh host's filesystem. In containerized setups (`ssh host docker exec container`) the `done` marker and `run.log` live *inside the container* and are invisible from the host — so the wait would either error out or hang forever. `--via` makes the hop chain explicit so every check runs at the right layer. If you find yourself wanting to "just check quickly with a raw ssh+tail," stop: that's the polling anti-pattern, and in a container setup it'll read the wrong layer anyway.
 
@@ -150,38 +154,50 @@ This single step is the difference between the skill being worth it and not.
 
 ### Phase 5 — Read the result
 
-Branch on the exit code from Phase 4.
+**First, check Phase 4's own exit code** (not the ASV exit code printed inside the output):
 
-**Exit code 0 (ASV completed normally):**
+- **4 (wrapper-died)**: The ASV process was killed before finishing (container restart, OOM, manual kill). The run produced no usable results. Dispatch the monitor subagent (see below) to read the partial log and diagnose, then decide whether to relaunch.
+- **3 (timed-out)**: The run exceeded `--timeout`. Either raise the timeout or investigate why ASV is stuck. Dispatch the monitor subagent to check the log tail.
+- **2 (run dir not found)**: Shouldn't happen if Phase 3 succeeded; re-verify the path and `--via`.
+- **0 (run finished)**: The ASV run completed. The printed ASV exit code tells you what kind of completion — see below.
 
-Call `compare-asv.py` to get a structured comparison. Don't read the raw log.
+**When Phase 4 returns 0 (run finished), the ASV exit code can be:**
+- `0` — ASV ran to completion with no threshold-crossing change detected (for `asv continuous`) or just finished normally (for `asv run`).
+- `1` — `asv continuous` detected a performance change (regression OR improvement). **This is a valid result, not a failure.** Proceed to compare-asv.py to see the details.
+- Other non-zero — ASV itself errored (environment failure, build failure, benchmark crash). This is a real failure; dispatch the monitor subagent.
+
+**Normal path (ASV exit 0 or 1): run compare-asv.py.**
 
 ```bash
-./scripts/compare-asv.py --results-dir <remote-results-dir> [--baseline <hash>] [--candidate <hash>]
+./scripts/compare-asv.py --results-dir <results-dir-on-asv-machine> \
+  --baseline <commit-hash> --candidate <commit-hash> \
+  [--machine <name>] [--environment <env-name>] \
+  [--threshold 5] [--policy no-regression]
 ```
 
-(If the results live on the remote server, run this over SSH or rsync the `.asv/results/` directory down first — `compare-asv.py` works on local files.)
+**Finding the results directory:** ASV stores results in the directory named by `results_dir` in `asv.conf.json` — often `results/` relative to the asv_bench directory, **not** `.asv/results/` (that's a common misconception). Check `asv.conf.json` if unsure. The results directory must be accessible from where you run compare-asv.py; if it's on the remote server, rsync it down or run the script over SSH.
 
-The script prints a markdown table:
+The script prints a markdown table with one row per parameter case (parameterized benchmarks are NOT merged — each parameter combination gets its own row):
 
 ```
-| benchmark | baseline | candidate | change | significant |
-|-----------|----------|-----------|--------|-------------|
-| suite.foo | 1.23 ms  | 1.18 ms   | -4.1%  | yes         |
+| benchmark | baseline | candidate | ratio | status |
+|-----------|----------|-----------|-------|--------|
+| suite.foo(2, 'count') | 16.0 ms | 8.16 ms | 0.51 | IMPROVED ✅ |
+| suite.bar(4, 'var') | 46.3 ms | 32.4 ms | 0.70 | PASS ✅ |
 ```
 
-And exits with: `0` = no regression, `1` = regression present, `2` = couldn't compare (missing baseline, environment mismatch, etc.).
+Exit codes: `0` = all cases pass the policy, `1` = at least one case fails, `2` = couldn't compare (missing results, ambiguous machine/env, commit not found).
 
-The main agent reads this table and the exit code. That's the entire result-reading step.
+The main agent reads this table and the exit code. That's the entire result-reading step for normal runs.
 
-**Exit code non-zero, or compare-asv.py returns 2:**
+**Failure path (ASV exit non-zero/non-one, or compare-asv.py returns 2, or wrapper-died):**
 
 Something went wrong — environment failure, ASV crash, missing baseline. The raw `run.log` may be long. **Do not read it directly.** Dispatch a low-model subagent:
 
 - Dispatch a **low-model subagent** (the whole point is to not burn high-reasoning tokens on log reading). The exact dispatch method depends on your host agent:
     - **Codex**: spawn the `asv_monitor` custom agent defined in `.codex/agents/asv-monitor.toml` (if that file isn't in the project yet, copy it from `references/codex-setup.md` first). The toml already pins a lightweight model and read-only sandbox, so you don't specify those at dispatch time.
     - **ZCode / Claude Code**: use the `Agent` tool with `model: "haiku"` and `subagent_type: "general-purpose"`.
-- Pass the prompt from `references/monitor-prompt.md`, filling in the run directory and SSH host.
+- Pass the prompt from `references/monitor-prompt.md`, filling in the exec prefix and run directory.
 - The subagent reads the log, classifies the failure, and returns a ≤200-word summary.
 - The main agent acts on the summary, never on the raw log.
 
@@ -207,13 +223,14 @@ When reporting, always include: the comparison table, the run directory path, th
 - **Checking files at the wrong layer in a container setup.** If ASV runs in `ssh host docker exec container`, then `done`, `run.log`, `exit_code` all live *inside the container*. `ssh host cat /tmp/run.log` reads the host filesystem, not the container's — it'll be empty even though ASV ran fine. Always use the `--via` prefix that reaches the ASV machine, and `--run-dir` as the path inside that machine.
 - **Skipping the local fast gate.** ASV runs are hours. Local tests are seconds. Catching a typo at the local stage saves an entire wasted server run. Always run Phase 2.
 - **Guessing the SSH host or ASV command.** These vary per project and per run. Wrong host = connection failure, wrong command = wasted run. Ask.
-- **Retrying blindly on ASV failure.** A non-zero exit code is usually an environment problem (missing dependency, conda env issue, disk full), not a code regression. Read the failure summary and fix the root cause before re-running. Re-running the same broken command 3 times just burns server time.
-- **Forgetting to copy the scripts to the project on first run.** The scripts live in this skill to be portable, but the project needs its own copy in `scripts/` so the run-directory layout is stable. Don't keep calling them from the skill directory long-term — copy once, commit, move on.
+- **Treating `asv continuous` exit 1 as a failure.** `asv continuous` returns exit 1 when it detects a performance change (regression *or* improvement) — that's a valid comparison result, not a crash. Only treat it as a failure if compare-asv.py also can't produce results (exit 2) or the log shows a traceback/build error. The skill's `wait-for-asv.sh` passes the ASV exit code through without judging it; don't second-guess that in the main agent.
+- **Retrying blindly on ASV failure.** A non-zero exit code (other than `asv continuous`'s 1) is usually an environment problem (missing dependency, conda env issue, disk full), not a code regression. Read the failure summary and fix the root cause before re-running. Re-running the same broken command 3 times just burns server time.
+- **Putting scripts or run directories inside the project source tree.** This pollutes `git status` and complicates PRs, especially for forks of upstream projects. Deploy scripts to a fixed path outside the repo (e.g. `~/.local/share/perf-bench-loop/`), and put run directories outside the repo too (e.g. `~/asv-runs/`).
 
 ## References
 
 - `[monitor-prompt.md](references/monitor-prompt.md)` — load this when dispatching the low-model subagent in Phase 5's failure branch. It's the prompt template.
 - `[codex-setup.md](references/codex-setup.md)` — load this on first use in Codex. It contains the `.codex/agents/asv-monitor.toml` file to drop into the project so the low-model monitor subagent has a pinned lightweight model and read-only sandbox. ZCode/Claude Code users can ignore this file.
-- `scripts/asv-background.sh` — run with no args to see usage. Copies into the target project's `scripts/` directory.
-- `scripts/wait-for-asv.sh` — run with no args to see usage. Copies into the target project's `scripts/` directory.
-- `scripts/compare-asv.py` — run with `--help` for full options. Stays in the skill directory; can be invoked locally or over SSH.
+- `scripts/asv-background.sh` — run with no args to see usage. Deploy to a fixed path on the ASV machine.
+- `scripts/wait-for-asv.sh` — run with no args to see usage. Runs locally; reaches the ASV machine via `--via`.
+- `scripts/compare-asv.py` — run with `--help` for full options. Runs locally on the results directory (rsync it down or run over SSH).
