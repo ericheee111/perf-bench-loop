@@ -29,7 +29,7 @@ Result: token cost of waiting drops from "hours of high-reasoning polling" to "o
 
 ## Workflow (6 phases)
 
-1. **Prepare** — confirm SSH host, ASV command, local test command. Copy helper scripts to the project on first use.
+1. **Prepare** — confirm SSH host, ASV command, local test command. Deploy helper scripts to a fixed path outside the project source tree on first use.
 2. **Implement + local fast gate** — make the optimization, run fast local tests (seconds) before touching ASV (hours).
 3. **Launch remote ASV** — start `asv run` in the background on the server, write `pid`/`run.log`/`exit_code`/`done` to a stable run directory, return immediately.
 4. **Wait** — one call to `wait-for-asv.sh` SSHes to the server and blocks on the `done` marker. One tool call, regardless of whether ASV takes 5 minutes or 5 hours. **The main agent does not poll.**
@@ -65,7 +65,8 @@ perf-bench-loop/
 │   ├── asv-background.sh          Launch ASV in background, write status files
 │   ├── wait-for-asv.sh            SSH + block on `done` marker (the token saver)
 │   ├── compare-asv.py             Parse ASV results.json, emit markdown table
-│   └── validate-asv-selection.py  Pre-check -b selectors, write expected-cases.txt
+│   ├── validate-asv-selection.py  Pre-check -b selectors, write expected-cases.jsonl
+│   └── expected_cases.py          Shared JSONL read/write for expected-cases
 └── references/
     ├── monitor-prompt.md          Prompt template for the low-model log reader
     └── codex-setup.md             .codex/agents/asv-monitor.toml for Codex

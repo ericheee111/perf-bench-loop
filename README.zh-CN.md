@@ -63,7 +63,8 @@ perf-bench-loop/
 │   ├── asv-background.sh          后台启动 ASV，写状态文件
 │   ├── wait-for-asv.sh            SSH + 阻塞等 `done` 标记（省 token 核心）
 │   ├── compare-asv.py             解析 ASV results.json，生成 markdown 对比表
-│   └── validate-asv-selection.py  预检 -b selector，写 expected-cases.txt
+│   ├── validate-asv-selection.py  预检 -b selector，写 expected-cases.jsonl
+│   └── expected_cases.py          共享 JSONL 读写 expected-cases
 └── references/
     ├── monitor-prompt.md          低模型日志读取子代理的 prompt 模板
     └── codex-setup.md             Codex 用的 .codex/agents/asv-monitor.toml

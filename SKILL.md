@@ -70,7 +70,14 @@ Gather the following before touching anything. Don't guess any of it — every m
 5. **Benchmark command** — the subcommand and flags. For ASV, e.g. `continuous --factor 1.05 <base> HEAD`, `run --branch=HEAD`. Ask the user every time. `asv-background.sh` currently prepends `asv` itself, so pass only the ASV subcommand and flags. **Do not use `--quick`** for runs whose results you want to compare — ASV does not save results from quick runs, so compare-asv.py will find nothing. Use `--quick` only for early smoke testing (does the benchmark even run without errors?).
 6. **Local test command** — what to run locally for the fast gate in Phase 2. Ask if not obvious from the project (`pytest -x` is a reasonable default for Python projects; never assume).
 
-**First-run setup:** the skill's scripts (`asv-background.sh`, `wait-for-asv.sh`) need to be accessible on the benchmark machine. Deploy them to a **fixed location outside the project source tree** (e.g. `~/.local/share/perf-bench-loop/` or `/home/<user>/tools/perf-bench-loop/` on the benchmark machine), not inside the project's `scripts/` directory. This avoids polluting the project's `git status` — especially important for forks of upstream projects where stray files complicate PRs. Use `scp` or `rsync` to push them, `chmod +x`, and record the deployment path for use in Phase 3.
+**First-run setup:** the skill's scripts need to be accessible on the benchmark machine. Deploy ALL of these to a **fixed location outside the project source tree** (e.g. `~/.local/share/perf-bench-loop/` or `/home/<user>/tools/perf-bench-loop/` on the benchmark machine):
+- `asv-background.sh` — launches ASV in background
+- `wait-for-asv.sh` — runs locally (your machine), reaches ASV machine via `--via`
+- `validate-asv-selection.py` — runs ON the benchmark machine (needs access to benchmarks.json)
+- `compare-asv.py` — runs locally on the results directory
+- `expected_cases.py` — shared module used by both validate and compare (must be in the same directory)
+
+`asv-background.sh` and `validate-asv-selection.py` run on the benchmark machine; `wait-for-asv.sh` and `compare-asv.py` run locally. Deploy all to the benchmark machine (for the first two) and keep locally (for the latter two). `expected_cases.py` must be alongside both `validate-asv-selection.py` and `compare-asv.py`.
 
 Run directories should also live outside the project tree (e.g. `/home/<user>/bench-runs/<timestamp>`), for the same reason.
 
@@ -96,19 +103,21 @@ Goal: start ASV in the background on the server and return immediately. Do not w
 
 1. **Resolve baseline and candidate to full SHAs.** Run `git rev-parse <baseline>` and `git rev-parse <candidate>` (locally or on the remote). Record the full 40-char hashes — you'll need them for compare-asv.py later.
 2. **Verify the remote HEAD matches the candidate commit.** Run: `<exec-prefix> bash -lc "cd <remote-project-root> && git rev-parse HEAD"` and confirm it matches the candidate SHA from step 1. If it doesn't match, stop and tell the user — the remote needs to be updated (git fetch/checkout/pull) before running ASV.
-3. **Refresh or read benchmark metadata.** ASV stores benchmark metadata in `<results-dir>/benchmarks.json`. If it's stale (benchmarks were added/renamed since last `asv check`), run `asv check` first to refresh it. You need this file for selector validation.
-4. **Validate all selectors with `validate-asv-selection.py`.** This is mandatory before launching ASV. Run it with the same `-b` selectors you plan to pass to ASV:
+3. **Refresh or read benchmark metadata.** ASV stores benchmark metadata in `<results-dir>/benchmarks.json`. If it's stale (benchmarks were added/renamed since last run), refresh it with `asv run --bench just-discover` (NOT `asv check` — `asv check` does not save benchmarks.json). You need this file for selector validation.
+4. **Validate all selectors with `validate-asv-selection.py`.** This is mandatory before launching ASV. The validator runs ON THE BENCHMARK MACHINE (same filesystem layer as ASV) via the exec prefix. Use `--output-file` to write the expected-cases file to a path OUTSIDE the run directory (a sibling file), since `asv-background.sh` requires the run directory to be empty:
 
    ```bash
-   ./scripts/validate-asv-selection.py \
-     --benchmarks-file <results-dir>/benchmarks.json \
-     --run-dir <bench-runs-root>/<timestamp> \
-     <asv-subcommand-and-flags-including-all-b-selectors>
+   <exec-prefix> bash -lc '<env-activation> && cd <remote-project-root> && \
+     <script-deploy-path>/validate-asv-selection.py \
+       --benchmarks-file <results-dir>/benchmarks.json \
+       --output-file <bench-runs-root>/<timestamp>.expected-cases.jsonl \
+       <asv-subcommand-and-flags-including-all-b-selectors>'
    ```
 
-   This script checks EACH selector individually — if any selector matches zero benchmarks (due to typo, CR contamination, renamed benchmark, or bad regex), it exits 1 and ASV must NOT be launched. It also writes `<run-dir>/expected-cases.txt`, which compare-asv.py will use later to filter out stale data from the shared results file.
-5. **Write expected-cases.txt** (done by step 4 automatically). This file lists every benchmark case (including parameter combinations) that this run is expected to produce. compare-asv.py uses it to ensure only fresh data appears in the report.
-6. **Launch ASV** via the background script, wrapped in your exec prefix:
+   This script checks EACH selector individually using ASV's exact matching semantics (expands parameter combinations, constructs `benchmark.name(param1, param2)` labels, applies `re.search`). If any selector matches zero cases or has invalid regex, it exits 1 and ASV must NOT be launched. It also strips trailing CR from selectors before matching. It writes `expected-cases.jsonl` (JSON Lines format), which compare-asv.py will use later to filter out stale data.
+
+   **Do NOT use `--quick`, `--dry-run`, `--skip-existing`, `--skip-existing-successful`, `--skip-existing-failed`, or `--skip-existing-commits`** for runs whose results you want to compare. These modes either don't save results or skip benchmarks, producing incomplete data that compare-asv.py cannot reliably validate.
+5. **Launch ASV** via the background script, using a FRESH EMPTY run directory (the validator's output file is a sibling, not inside the run directory):
 
    ```bash
    # Direct SSH
@@ -123,8 +132,8 @@ Goal: start ASV in the background on the server and return immediately. Do not w
    ```
 
    The `bash -lc` + env-activation wrapper is needed when the exec target (e.g. `docker exec`) defaults to a non-login shell that doesn't load env hooks. If there's no env activation, drop that wrapper and run the script directly.
-7. **Verify the launch took:** use the exec prefix to check the pid file exists within a few seconds. If not, the launch failed — do not proceed to waiting.
-8. **Record three things:** the run directory path (for Phase 4/5 `--run-dir`), the exec prefix for reaching the ASV machine's filesystem (for Phase 4 `--via` — without env activation), and the expected-cases.txt path (for Phase 5 `--expected-cases-file`).
+6. **Verify the launch took:** use the exec prefix to check the pid file exists within a few seconds. If not, the launch failed — do not proceed to waiting.
+7. **Record three things:** the run directory path (for Phase 4/5 `--run-dir`), the exec prefix for reaching the ASV machine's filesystem (for Phase 4 `--via` — without env activation), and the expected-cases.jsonl path (for Phase 5 `--expected-cases-file`).
 
 You're now done for this phase. The ASV run is running detached.
 
@@ -189,7 +198,7 @@ Always pass `--expected-cases-file` (from Phase 3 step 5) so the comparison only
 ```bash
 ./scripts/compare-asv.py --results-dir <results-dir-on-asv-machine> \
   --baseline <commit-hash> --candidate <commit-hash> \
-  --expected-cases-file <run-dir>/expected-cases.txt \
+  --expected-cases-file <bench-runs-root>/<timestamp>.expected-cases.jsonl \
   [--machine <name>] [--environment <env-name>] \
   [--threshold 5] [--policy no-regression]
 ```
@@ -255,4 +264,5 @@ When reporting, always include: the comparison table, the run directory path, th
 - `scripts/asv-background.sh` — run with no args to see usage. Deploy to a fixed path on the benchmark machine.
 - `scripts/wait-for-asv.sh` — run with no args to see usage. Runs locally; reaches the ASV machine via `--via`.
 - `scripts/compare-asv.py` — run with `--help` for full options. Runs locally on the results directory (rsync it down or run over SSH). Pass `--expected-cases-file` to filter out stale data.
-- `scripts/validate-asv-selection.py` — run before launching ASV. Validates each `-b` selector individually and writes `expected-cases.txt`. Run with `--help` for options.
+- `scripts/validate-asv-selection.py` — run before launching ASV (ON the benchmark machine). Validates each `-b` selector individually and writes `expected-cases.jsonl`. Run with `--help` for options.
+- `scripts/expected_cases.py` — shared module for reading/writing expected-cases JSONL. Not run directly.

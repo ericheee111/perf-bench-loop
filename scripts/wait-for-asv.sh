@@ -140,8 +140,9 @@ set -e
 
 if [ "$via_check_rc" -ne 0 ]; then
     # Check if it's a transport error (ssh returns 255, command not found
-    # returns 127) vs a genuine "directory not found" (test returns 1).
-    if [ "$via_check_rc" -eq 255 ] || [ "$via_check_rc" -eq 127 ] || [ "$via_check_rc" -eq 126 ]; then
+    # returns 127, permission denied returns 126, connection refused can
+    # return 125) vs a genuine "directory not found" (test returns 1).
+    if [ "$via_check_rc" -ge 125 ]; then
         echo "error: transport failure (exit $via_check_rc) reaching the ASV machine via: $via" >&2
         echo "  stderr: $(cat /tmp/wait-via-err 2>/dev/null | head -1)" >&2
         rm -f /tmp/wait-via-err
