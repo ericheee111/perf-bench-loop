@@ -38,7 +38,7 @@ Result: token cost of waiting drops from "hours of high-reasoning polling" to "o
 
 ## Installation
 
-This skill follows the standard agentskills.io layout. Drop the `asv-optimize-loop/` directory into any of:
+This skill follows the standard agentskills.io layout. Drop the `perf-bench-loop/` directory into any of:
 
 - `<project>/.agents/skills/` — project-local
 - `~/.agents/skills/` — user-global (this is where it lives on the author's machine)
@@ -54,7 +54,7 @@ ZCode/Claude Code needs no such file — the main agent dispatches the subagent 
 ## Files
 
 ```
-asv-optimize-loop/
+perf-bench-loop/
 ├── SKILL.md                       Main entry point — the 6-phase workflow
 ├── scripts/
 │   ├── asv-background.sh          Launch ASV in background, write status files

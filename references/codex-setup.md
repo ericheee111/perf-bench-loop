@@ -31,7 +31,7 @@ Save this verbatim as `.codex/agents/asv-monitor.toml`:
 ```toml
 # .codex/agents/asv-monitor.toml
 # Pinned lightweight subagent for reading failed ASV logs.
-# Spawned by the asv-optimize-loop skill when an ASV run fails and the
+# Spawned by the perf-bench-loop skill when an ASV run fails and the
 # comparison table can't be produced. Read-only so it can't damage the
 # run directory or source tree.
 

@@ -38,7 +38,7 @@
 
 ## 安装
 
-本 skill 遵循标准 agentskills.io 布局。把 `asv-optimize-loop/` 目录放到以下任一位置：
+本 skill 遵循标准 agentskills.io 布局。把 `perf-bench-loop/` 目录放到以下任一位置：
 
 - `<project>/.agents/skills/`——项目级
 - `~/.agents/skills/`——用户级（作者机器上就放在这里）
@@ -54,7 +54,7 @@ ZCode/Claude Code 不需要这个文件——主代理在调用时直接用 `mod
 ## 文件结构
 
 ```
-asv-optimize-loop/
+perf-bench-loop/
 ├── SKILL.md                       主入口——6 阶段工作流
 ├── scripts/
 │   ├── asv-background.sh          后台启动 ASV，写状态文件
