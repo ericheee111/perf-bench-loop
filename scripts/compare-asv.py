@@ -551,6 +551,24 @@ def print_table(
 # CLI
 # ---------------------------------------------------------------------------
 
+def finite_nonnegative_float(raw: str) -> float:
+    """argparse type-checker: reject NaN, Inf, -Inf, and negative values.
+
+    These would silently break comparison logic: NaN comparisons are always
+    False (so thresholds never trigger), Inf makes every change look like
+    either a regression or an improvement, and negative thresholds invert
+    the intended direction.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a valid float: {raw!r}")
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"value must be finite, got {raw!r}")
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"value must be non-negative, got {value}")
+    return value
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Compare two ASV 0.6.x result sets, per parameter case.",
@@ -566,12 +584,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Restrict to results from this machine.")
     p.add_argument("--environment", default=None,
                    help="Restrict to results from this env_name.")
-    p.add_argument("--threshold", type=float, default=5.0,
+    p.add_argument("--threshold", type=finite_nonnegative_float, default=5.0,
                    help="Regression threshold in percent. Default 5.")
     p.add_argument("--policy", choices=["no-regression", "require-improvement"],
                    default="no-regression",
                    help="Comparison policy. Default: no-regression.")
-    p.add_argument("--min-gain", type=float, default=5.0,
+    p.add_argument("--min-gain", type=finite_nonnegative_float, default=5.0,
                    help="Min improvement %% required under require-improvement. Default 5.")
     return p.parse_args(argv)
 
