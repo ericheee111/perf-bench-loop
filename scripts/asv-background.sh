@@ -49,6 +49,24 @@ fi
 run_dir="$1"
 shift
 
+# Strip trailing CR (\r) from every argument. This is a defensive measure
+# against CRLF contamination when the script is invoked from Windows-side
+# shells (PowerShell, Git Bash) over SSH/docker exec. A trailing \r on an
+# ASV benchmark selector (e.g. `rolling.Apply.time_rolling\r`) silently
+# fails to match any benchmark, and ASV runs to completion with exit 0
+# having skipped that benchmark — the result file then contains stale data
+# from a previous run, which is far worse than an obvious error.
+# Also strip from run_dir for the same reason.
+#
+# We use tr -d '\r' instead of ${arg%$'\r'} because the latter is unreliable
+# in for-loop array contexts on some bash versions (Git Bash on Windows).
+run_dir=$(printf '%s' "$run_dir" | tr -d '\r')
+clean_args=()
+for arg in "$@"; do
+    clean_args+=("$(printf '%s' "$arg" | tr -d '\r')")
+done
+set -- "${clean_args[@]}"
+
 # Resolve to an absolute path so the detached process can find it regardless
 # of working directory changes. $PWD is used deliberately (not readlink -f)
 # so the path matches what the caller expects on both Linux and macOS.
