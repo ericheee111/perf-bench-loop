@@ -70,6 +70,7 @@ import json
 import statistics
 import sys
 from dataclasses import dataclass, field
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -246,6 +247,14 @@ def extract_cases(run: AsvRun) -> list[tuple[str, tuple, float | None]]:
     Returns a list of (benchmark_name, params_tuple, median_value).
     median_value is None if the benchmark failed (null/empty result).
     Each parameter combination produces one entry — they are NOT merged.
+
+    ASV 0.6.x parameter layout (verified against real result files):
+    - The 'params' column holds the parameter AXES, not combinations.
+      e.g. params = [['2','4','8'], ['count','last',...]]  (2 axes)
+    - The 'result' column holds one entry per parameter COMBINATION,
+      in itertools.product(*params) order (last axis varies fastest).
+      e.g. result = [val(2,count), val(2,last), ..., val(8,var)]  (24 entries)
+    - So we must expand params via product() to get the correct pairing.
     """
     result_idx = _column_index(run, "result")
     params_idx = _column_index(run, "params")
@@ -257,26 +266,44 @@ def extract_cases(run: AsvRun) -> list[tuple[str, tuple, float | None]]:
         if not isinstance(columns, list) or result_idx >= len(columns):
             continue
 
-        result_col = columns[result_idx]  # list of values, one per param combo
+        result_col = columns[result_idx]
         param_col = columns[params_idx] if params_idx is not None and params_idx < len(columns) else None
 
-        # result_col is a list of measurement-samples-lists (or nulls),
-        # one entry per parameter combination.
-        if not isinstance(result_col, list):
-            # Non-parameterized benchmark: single scalar or single sample list
-            median = _median_of_value(result_col)
-            params_tuple: tuple = ()
-            if param_col is not None and isinstance(param_col, list) and param_col:
-                params_tuple = _normalize_params(param_col[0]) if not isinstance(param_col[0], list) else _normalize_params(param_col)
-            cases.append((bench_name, params_tuple, median))
+        # Determine parameter combinations via product(*param_axes).
+        # param_col is a list of axes: [[axis0_values], [axis1_values], ...]
+        # product(*param_col) gives the cartesian product in the correct order.
+        if param_col and isinstance(param_col, list) and all(isinstance(a, list) for a in param_col):
+            param_combinations = list(product(*param_col))
+            param_tuples = [tuple(str(x) for x in combo) for combo in param_combinations]
+        elif param_col and isinstance(param_col, list) and param_col:
+            # Single-axis parameter (flat list of values).
+            param_tuples = [tuple([str(x)]) for x in param_col]
+        else:
+            # Non-parameterized benchmark.
+            param_tuples = [()]
+
+        # result_col should have one entry per param combination.
+        # Each entry is either a scalar (the median already computed by ASV)
+        # or a list of measurement samples, or null (failed).
+        if result_col is None:
+            values = [None] * len(param_tuples)
+        elif isinstance(result_col, list):
+            values = result_col
+        else:
+            # Single scalar result, non-parameterized.
+            values = [result_col]
+
+        # Guard: mismatched counts indicate a parse error or corrupted file.
+        if len(values) != len(param_tuples):
+            print(
+                f"warn: {bench_name}: result count ({len(values)}) != "
+                f"param combination count ({len(param_tuples)}), skipping",
+                file=sys.stderr,
+            )
             continue
 
-        # Parameterized: result_col[i] is the samples for the i-th param combo.
-        for i, samples in enumerate(result_col):
-            params_tuple = ()
-            if param_col is not None and isinstance(param_col, list) and i < len(param_col):
-                params_tuple = _normalize_params(param_col[i])
-            median = _median_of_value(samples)
+        for params_tuple, value in zip(param_tuples, values):
+            median = _median_of_value(value)
             cases.append((bench_name, params_tuple, median))
 
     return cases
@@ -448,7 +475,11 @@ def print_table(
 
     if not rows:
         print("(no common benchmark cases to compare)")
-        return False
+        if only_baseline or only_candidate:
+            print(f"  only in baseline: {len(only_baseline)}, only in candidate: {len(only_candidate)}")
+        print()
+        print("SUMMARY: no common cases — comparison impossible")
+        return True  # no common cases = failure
 
     print("| benchmark | baseline | candidate | ratio | status |")
     print("|-----------|----------|-----------|-------|--------|")
@@ -489,10 +520,20 @@ def print_table(
         for name in only_candidate:
             print(f"  - {name}")
 
+    # Missing cases count as failure under both policies. If candidate is
+    # missing cases that baseline had (or vice versa), the comparison is
+    # incomplete and must not silently pass.
+    if only_baseline or only_candidate:
+        any_fail = True
+
     # Summary — grep-friendly.
     status_counts: dict[str, int] = {}
     for r in rows:
         status_counts[r.status] = status_counts.get(r.status, 0) + 1
+    if only_baseline:
+        status_counts["only_baseline"] = len(only_baseline)
+    if only_candidate:
+        status_counts["only_candidate"] = len(only_candidate)
     parts = [f"{count} {status.lower()}" for status, count in sorted(status_counts.items())]
     print()
     print(f"SUMMARY: {', '.join(parts)}")
@@ -562,6 +603,15 @@ def main(argv: list[str]) -> int:
     rows, only_baseline, only_candidate = compare_runs(
         baseline, candidate, args.threshold, args.policy, args.min_gain
     )
+
+    # P0.3: zero common cases = cannot compare, exit 2 (not exit 0).
+    if not rows:
+        print_table(
+            rows, baseline, candidate, only_baseline, only_candidate,
+            args.threshold, args.policy, args.min_gain
+        )
+        return 2
+
     any_fail = print_table(
         rows, baseline, candidate, only_baseline, only_candidate,
         args.threshold, args.policy, args.min_gain
