@@ -84,9 +84,10 @@ Procedure:
    - Lines mentioning environment setup (conda, pip, Building,
      Installing) to distinguish environment failures from benchmark
      failures
-3. Check whether the process is still running:
-   <exec_prefix> ps -p $(cat <run_dir>/pid)
-3. Classify the failure into exactly one category:
+3. Check whether the process is still running. The pid file is on
+   the ASV machine, so read it through the exec prefix:
+   <exec_prefix> bash -c 'pid=$(cat <run_dir>/pid) && ps -p "$pid"'
+4. Classify the failure into exactly one category:
    - environment     — missing dep, conda env failed, disk full,
                        permission error, ASV config problem
    - benchmark_crash — at least one benchmark ran but threw an exception

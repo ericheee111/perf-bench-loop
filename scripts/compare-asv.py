@@ -345,6 +345,9 @@ def _median_of_value(value: Any) -> float | None:
 def format_value(value: float | None) -> str:
     if value is None:
         return "n/a"
+    # NaN/Inf: display as n/a rather than meaningless unit-scaled numbers.
+    if not math.isfinite(value):
+        return "n/a"
     if value < 1e-6:
         return f"{value * 1e9:.2f} ns"
     if value < 1e-3:
@@ -548,6 +551,61 @@ def print_table(
 
 
 # ---------------------------------------------------------------------------
+# Expected-cases loading
+# ---------------------------------------------------------------------------
+
+def _parse_case_label(label: str) -> tuple[str, tuple]:
+    """Parse a case label like 'bench.name(p1, p2)' into (name, params_tuple)."""
+    if "(" in label and label.endswith(")"):
+        name = label[:label.index("(")]
+        params_str = label[label.index("(") + 1 : -1]
+        params = tuple(p.strip() for p in params_str.split(", ")) if params_str else ()
+    else:
+        name = label
+        params = ()
+    return (name, params)
+
+
+def _parse_case_labels(labels: list[str]) -> set[tuple[str, tuple]]:
+    """Parse a list of case labels into a set of (name, params) pairs."""
+    return {_parse_case_label(l) for l in labels}
+
+
+def load_expected_cases(path: Path) -> set[tuple[str, tuple]] | None:
+    """Load expected-cases.txt written by validate-asv-selection.py.
+
+    Each line is either:
+        benchmark_name
+        benchmark_name(param1, param2, ...)
+
+    Returns a set of (benchmark_name, params_tuple) pairs, or None if the
+    file can't be read (meaning "no filtering, compare everything").
+    """
+    if path is None:
+        return None
+    if not path.is_file():
+        print(f"error: expected-cases file not found: {path}", file=sys.stderr)
+        return None
+
+    cases: set[tuple[str, tuple]] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Parse "name(params)" or "name"
+        if "(" in line and line.endswith(")"):
+            name = line[:line.index("(")]
+            params_str = line[line.index("(") + 1 : -1]
+            # Split by ", " — params are comma-separated
+            params = tuple(p.strip() for p in params_str.split(", ")) if params_str else ()
+        else:
+            name = line
+            params = ()
+        cases.add((name, params))
+    return cases
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -591,6 +649,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Comparison policy. Default: no-regression.")
     p.add_argument("--min-gain", type=finite_nonnegative_float, default=5.0,
                    help="Min improvement %% required under require-improvement. Default 5.")
+    p.add_argument("--expected-cases-file", default=None, type=Path,
+                   help="Path to expected-cases.txt (from validate-asv-selection.py). "
+                        "When given, only these cases appear in the report, and any "
+                        "expected case missing from baseline or candidate returns exit 2. "
+                        "This prevents stale data from shared result files from "
+                        "appearing as fresh results.")
     return p.parse_args(argv)
 
 
@@ -625,22 +689,71 @@ def main(argv: list[str]) -> int:
         print(f"error: baseline and candidate resolved to the same file ({baseline.path}).", file=sys.stderr)
         return 2
 
+    # Load expected cases if provided. When given, only these cases appear
+    # in the report, and any expected case missing from the result files
+    # is treated as exit 2 (incomplete data).
+    expected_cases = load_expected_cases(args.expected_cases_file) if args.expected_cases_file else None
+
     rows, only_baseline, only_candidate = compare_runs(
         baseline, candidate, args.threshold, args.policy, args.min_gain
     )
 
-    # P0.3: zero common cases = cannot compare, exit 2 (not exit 0).
-    if not rows:
+    # If expected-cases filtering is active, filter rows to only expected cases
+    # and detect missing expected cases (→ exit 2).
+    missing_expected: list[str] = []
+    if expected_cases is not None:
+        row_keys = {(r.benchmark, r.params) for r in rows}
+        # Also check only_baseline/only_candidate — those are common cases
+        # that exist on one side but not the other, which is already handled.
+        # But we need to find expected cases that are on NEITHER side.
+        all_available_keys = row_keys | {(name, params) for name, params in
+                                          _parse_case_labels(only_baseline) | _parse_case_labels(only_candidate)}
+        for ec in sorted(expected_cases):
+            if ec not in all_available_keys:
+                missing_expected.append(f"{ec[0]}{format_params(ec[1])}")
+        # Filter rows to only expected cases
+        rows = [r for r in rows if (r.benchmark, r.params) in expected_cases]
+        # Clear only_baseline/only_candidate since we're filtering — don't
+        # report cases outside the expected set as "missing"
+        only_baseline = []
+        only_candidate = []
+
+    # Exit code semantics:
+    #   0 = data comparable, policy passes
+    #   1 = data comparable, policy fails (regression / no improvement)
+    #   2 = incomplete/unreliable: no common cases, NOT_COMPARABLE/FAILED
+    #       cases, missing expected cases, or missing cases on one side.
+
+    # Missing expected cases → exit 2
+    if missing_expected:
+        print(f"error: {len(missing_expected)} expected case(s) missing from results:", file=sys.stderr)
+        for m in missing_expected[:10]:
+            print(f"  - {m}", file=sys.stderr)
+        if len(missing_expected) > 10:
+            print(f"  ... and {len(missing_expected) - 10} more", file=sys.stderr)
+
+    # Zero common cases → exit 2
+    if not rows and not missing_expected:
         print_table(
             rows, baseline, candidate, only_baseline, only_candidate,
             args.threshold, args.policy, args.min_gain
         )
         return 2
 
+    # Check for NOT_COMPARABLE / FAILED in the result rows → exit 2
+    has_unreliable = any(r.status in ("NOT_COMPARABLE", "FAILED") for r in rows)
+
+    # Missing cases on one side only (without expected-cases filtering) → exit 2
+    if not expected_cases and (only_baseline or only_candidate):
+        has_unreliable = True
+
     any_fail = print_table(
         rows, baseline, candidate, only_baseline, only_candidate,
         args.threshold, args.policy, args.min_gain
     )
+
+    if missing_expected or has_unreliable or (not rows):
+        return 2
     return 1 if any_fail else 0
 
 

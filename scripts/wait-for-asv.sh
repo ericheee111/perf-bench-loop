@@ -43,12 +43,14 @@
 #   STATE: wrapper-died
 #
 # Exit status:
-#   0  Run finished normally (done appeared). Check printed EXIT_CODE for
-#      ASV's own status.
+#   0  Run finished normally (done appeared, exit_code is a valid integer).
+#      Check printed EXIT_CODE for ASV's own status.
 #   2  Run directory not found on the ASV machine.
 #   3  Timed out before `done` appeared.
 #   4  Wrapper process died (pid no longer alive) before `done` appeared.
-#   64 Usage error.
+#   5  Transport failure or corrupt run state (done exists but exit_code
+#      is missing/non-integer, or the transport command itself failed).
+#   64 Usage error (missing/blank --via, missing --run-dir, etc.).
 #
 set -euo pipefail
 
@@ -108,9 +110,16 @@ fi
 # Split --via into an argv array using read -ra. This is NOT eval — no shell
 # metacharacters are interpreted, no command substitution happens. The string
 # is simply split on whitespace into array elements, then passed as separate
-# argv entries to the command. This prevents injection via paths or arguments
-# containing quotes, $, backticks, etc.
+# argv entries to the command.
 read -ra via_arr <<< "$via"
+
+# A blank --via (empty string or whitespace only) is a usage error, not a
+# transport error. Catch it explicitly so the caller gets exit 64, not a
+# confusing "command not found" or silent success.
+if [ "${#via_arr[@]}" -eq 0 ]; then
+    echo "error: --via is blank; provide a command prefix like 'ssh <host>'" >&2
+    exit 64
+fi
 
 # Build the timeout wrapper array if requested. Using an array (not a string)
 # so the timeout command and its argument are separate argv entries.
@@ -120,14 +129,33 @@ if [ "$timeout_secs" -gt 0 ]; then
 fi
 
 # Validate the run directory exists ON THE ASV MACHINE.
-# Uses the argv array — no eval, no string concatenation.
-if ! "${via_arr[@]}" test -d "$run_dir"; then
+# Distinguish transport errors (ssh connection refused, host unreachable)
+# from "directory not found" (transport works but path is wrong).
+# A transport error typically has exit code 255 (ssh) or 126/127 (command
+# not found). We capture stderr to help diagnose.
+set +e
+"${via_arr[@]}" test -d "$run_dir" 2>/tmp/wait-via-err
+via_check_rc=$?
+set -e
+
+if [ "$via_check_rc" -ne 0 ]; then
+    # Check if it's a transport error (ssh returns 255, command not found
+    # returns 127) vs a genuine "directory not found" (test returns 1).
+    if [ "$via_check_rc" -eq 255 ] || [ "$via_check_rc" -eq 127 ] || [ "$via_check_rc" -eq 126 ]; then
+        echo "error: transport failure (exit $via_check_rc) reaching the ASV machine via: $via" >&2
+        echo "  stderr: $(cat /tmp/wait-via-err 2>/dev/null | head -1)" >&2
+        rm -f /tmp/wait-via-err
+        exit 5
+    fi
+    # Otherwise it's a genuine "directory not found"
     echo "error: run directory not found on the ASV machine: $run_dir" >&2
     echo "  (checked via: $via)" >&2
     echo "  If ASV runs in a container, --run-dir must be the path INSIDE the container," >&2
     echo "  and --via must include the docker exec hop." >&2
+    rm -f /tmp/wait-via-err
     exit 2
 fi
+rm -f /tmp/wait-via-err
 
 # Single call to the ASV machine. The remote shell script is passed via
 # heredoc with QUOTED delimiter (<<'REMOTE') so NO local variable expansion
@@ -163,7 +191,23 @@ done
 echo "RUN_DIR:"
 echo "$run_dir"
 echo "EXIT_CODE:"
-cat "$run_dir/exit_code" 2>/dev/null || echo "unknown"
+# Read exit_code. If the file is missing or contains a non-integer value,
+# the run is corrupt — `done` appeared but the wrapper didn't write a valid
+# exit code. Report corrupt-run (exit 5) so the caller doesn't treat it as
+# a normal completion.
+exit_code_file="$run_dir/exit_code"
+if [ ! -f "$exit_code_file" ]; then
+    echo "STATE: corrupt-run"
+    echo "DETAIL: done marker exists but exit_code file is missing"
+    exit 5
+fi
+exit_code_val=$(cat "$exit_code_file" 2>/dev/null)
+if ! echo "$exit_code_val" | grep -qE '^-?[0-9]+$'; then
+    echo "STATE: corrupt-run"
+    echo "DETAIL: exit_code file contains non-integer: '$exit_code_val'"
+    exit 5
+fi
+echo "$exit_code_val"
 exit 0
 REMOTE
 rc=$?

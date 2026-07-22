@@ -18,8 +18,11 @@
 #              to see the files too). A relative path is resolved against
 #              $PWD at launch time.
 #   ASV_CMD... The ASV command and its arguments to run, e.g.
-#              `run --quick` or `run --branch=HEAD`. The leading `asv` is
-#              added by this script — pass only the subcommand and flags.
+#              `continuous --factor 1.05 <base> HEAD` or `run --branch=HEAD`.
+#              The leading `asv` is added by this script — pass only the
+#              subcommand and flags. Do NOT use `--quick` for runs whose
+#              results you want to compare — ASV does not save quick-mode
+#              results.
 #
 # Files written to RUN_DIR:
 #   pid         PID of the background ASV process (written immediately)
@@ -58,14 +61,31 @@ shift
 # from a previous run, which is far worse than an obvious error.
 # Also strip from run_dir for the same reason.
 #
-# We use tr -d '\r' instead of ${arg%$'\r'} because the latter is unreliable
-# in for-loop array contexts on some bash versions (Git Bash on Windows).
-run_dir=$(printf '%s' "$run_dir" | tr -d '\r')
+# We use sed 's/\r$//' to strip only the TRAILING CR (not all CRs, which
+# tr -d '\r' would do). We don't use ${arg%$'\r'} because it is unreliable
+# in for-loop array contexts on Git Bash for Windows: it works for direct
+# variable assignment but silently fails (leaves the CR) when the variable
+# is an element iterated from an array. This is reproducible:
+#
+#   CR=$(printf 'x\r'); arr=("$CR"); for a in "${arr[@]}"; do echo "${a%$'\r'}" | od -An -tx1 | tail -c2; done
+#   # prints "0d" (CR still present) — the strip did NOT work
+#
+#   CR=$(printf 'x\r'); s="$CR"; echo "${s%$'\r'}" | od -An -tx1 | tail -c2
+#   # prints "78" (the 'x') — the strip DID work
+run_dir=$(printf '%s' "$run_dir" | sed 's/\r$//')
 clean_args=()
 for arg in "$@"; do
-    clean_args+=("$(printf '%s' "$arg" | tr -d '\r')")
+    clean_args+=("$(printf '%s' "$arg" | sed 's/\r$//')")
 done
 set -- "${clean_args[@]}"
+
+# After CR stripping, run_dir must not be empty (a path that was only \r
+# would become empty after stripping, which would cause mkdir to fail or
+# create the wrong directory).
+if [ -z "$run_dir" ]; then
+    echo "error: run_dir is empty after CR stripping" >&2
+    exit 64
+fi
 
 # Resolve to an absolute path so the detached process can find it regardless
 # of working directory changes. $PWD is used deliberately (not readlink -f)

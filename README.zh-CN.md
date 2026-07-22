@@ -33,17 +33,20 @@
 2. **实现 + 本地快测**——做优化，先跑本地快速测试（秒级），再上 ASV（小时级）。
 3. **启动远端 ASV**——在服务器后台启动 `asv run`，把 `pid`/`run.log`/`exit_code`/`done` 写到稳定的运行目录，立即返回。
 4. **等待**——一次调用 `wait-for-asv.sh`，SSH 到远端阻塞等 `done` 标记。**一次工具调用**，无论 ASV 跑 5 分钟还是 5 小时。**主代理不轮询。**
-5. **读结果**——成功路径下，`compare-asv.py` 生成 markdown before/after 对比表（exit code 0/1/2 = 无回归 / 有回归 / 无法比较）。失败路径下，派低模型子代理读日志，返回 ≤200 字摘要。
+5. **读结果**——成功路径下，`compare-asv.py` 生成 markdown before/after 对比表（exit code 0/1/2 = 通过 / 策略违规 / 数据不完整）。它使用 `expected-cases.txt`（由 `validate-asv-selection.py` 生成）确保只显示本轮数据——共享结果文件里的旧数据被排除。失败路径下，派低模型子代理读日志，返回 ≤200 字摘要。
 6. **决策与（可能的）迭代**——迭代模式下遇到回归，分析对比表回到 Phase 2。硬上限：3 次迭代。
 
 ## 安装
 
-本 skill 遵循标准 agentskills.io 布局。把 `perf-bench-loop/` 目录放到以下任一位置：
+本 skill 遵循标准 agentskills.io 布局。skill 目录（`perf-bench-loop/`）放到 skills 发现路径：
 
-- `<project>/.agents/skills/`——项目级
-- `~/.agents/skills/`——用户级（作者机器上就放在这里）
+| 客户端 | 项目级 | 用户级 |
+|---|---|---|
+| Codex | `<project>/.agents/skills/` | `~/.agents/skills/` |
+| ZCode | `<project>/.agents/skills/` | `~/.agents/skills/` |
+| Claude Code | `<project>/.claude/skills/` | `~/.claude/skills/` |
 
-Codex 和 ZCode/Claude Code 都会自动从这些路径发现 skill。
+跨客户端使用时，在 `.agents/skills/` 和 `.claude/skills/` 都安装，或用软链接指向同一份。
 
 ### Codex 额外配置
 
@@ -59,7 +62,8 @@ perf-bench-loop/
 ├── scripts/
 │   ├── asv-background.sh          后台启动 ASV，写状态文件
 │   ├── wait-for-asv.sh            SSH + 阻塞等 `done` 标记（省 token 核心）
-│   └── compare-asv.py             解析 ASV results.json，生成 markdown 对比表
+│   ├── compare-asv.py             解析 ASV results.json，生成 markdown 对比表
+│   └── validate-asv-selection.py  预检 -b selector，写 expected-cases.txt
 └── references/
     ├── monitor-prompt.md          低模型日志读取子代理的 prompt 模板
     └── codex-setup.md             Codex 用的 .codex/agents/asv-monitor.toml

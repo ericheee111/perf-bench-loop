@@ -26,7 +26,7 @@ You are an ASV (airspeed velocity) benchmark log analyst. Your job is to read a 
    - Lines containing `error`, `Error`, `ERROR`, `Traceback`, `failed`, `Failed`
    - The last 100 lines (where the fatal error usually is)
    - Lines mentioning environment setup (`conda`, `pip`, `Building`, `Installing`) to distinguish environment failures from benchmark failures
-3. Check whether the process is still running: `{{EXEC_PREFIX}} ps -p $(cat {{REMOTE_RUN_DIR}}/pid)`. If the process is still alive but `done` exists, something killed the wrapper.
+3. Check whether the process is still running. The pid file is on the ASV machine, so read it through the exec prefix: `{{EXEC_PREFIX}} bash -c 'pid=$(cat {{REMOTE_RUN_DIR}}/pid) && ps -p "$pid"'`. If the process is still alive but `done` exists, something killed the wrapper.
 
 **Classify the failure into exactly one category:**
 
