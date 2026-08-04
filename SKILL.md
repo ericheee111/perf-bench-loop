@@ -1,6 +1,6 @@
 ---
 name: perf-bench-loop
-description: Run long-running ASV (airspeed velocity) benchmarks on a remote server to validate performance optimizations, wait without agent polling, and compare a baseline commit with a candidate commit. Use only when the task explicitly involves ASV, airspeed velocity, or an ASV performance regression check. Do not use for generic pytest, remote tests, or arbitrary remote commands. Covers both one-shot validation and automatic fix-until-pass loops (max 3 iterations).
+description: Run long-running ASV (airspeed velocity) benchmarks on a remote server to validate performance optimizations, wait without agent polling, and compare a baseline commit with a candidate commit. Supports config-driven project setup, publication gate, preflight validation, unified orchestration, and optional progress probing. Use when the task explicitly involves ASV, airspeed velocity, or an ASV performance regression check. Do not use for generic pytest, remote tests, or arbitrary remote commands. Covers both one-shot validation and automatic fix-until-pass loops (max 3 iterations).
 ---
 
 # Perf Bench Loop
@@ -19,12 +19,20 @@ The result: token cost of waiting drops from "hours of high-reasoning polling" t
 
 ## How this skill runs in different agents
 
-The workflow below is agent-agnostic. The only piece that differs across host agents is **how a low-model subagent is dispatched** in Phase 5's failure branch. Two supported hosts:
+The workflow below is agent-agnostic. The only piece that differs across host agents is **how the probe subagent is dispatched** in Phase 4's probe mode, and **how the failure-diagnosis subagent is dispatched** in Phase 5's failure branch.
 
-- **Codex**: a project-level custom agent at `.codex/agents/asv-monitor.toml` pins a lightweight model and `read-only` sandbox. The main agent spawns it via the standard subagent mechanism. See `references/codex-setup.md` for the toml file to drop into the project.
-- **ZCode / Claude Code**: dispatch via the `Agent` tool with `model: "haiku"` (or whichever cheap tier is available) and `subagent_type: "general-purpose"`.
+### ZCode (no usage limit)
 
-Everywhere else, the workflow is identical: the same scripts, the same `compare-asv.py`, the same wait pattern. Pick the host-appropriate dispatch method when you reach Phase 5; don't worry about it before then.
+- **Probe**: main agent calls `probe-asv.sh` directly via the Bash tool. No subagent needed — Bash execution costs no reasoning tokens; only reading the ≤20-line result costs a little. Optionally, dispatch a GLM-5-Turbo subagent if you want the main agent turn to stay even shorter.
+- **Failure diagnosis**: dispatch the `Agent` tool with `model: "haiku"` (or GLM-5-Turbo) and `subagent_type: "general-purpose"`.
+
+### Codex (usage-limited)
+
+- **Probe**: dispatch the `asv_monitor` custom agent (pinned to a lightweight model — Terra or Luna — via `.codex/agents/asv-monitor.toml`). The toml's `developer_instructions` covers both probe and failure-diagnosis tasks; the main agent specifies which in its dispatch prompt.
+- **Failure diagnosis**: same `asv_monitor` subagent, different prompt.
+- **First-run**: copy `.codex/agents/asv-monitor.toml` from `references/codex-setup.md` into the project. Replace the `model` placeholder with your lightweight tier.
+
+Everywhere else, the workflow is identical: the same scripts, the same `compare-asv.py`, the same wait pattern.
 
 ## When to use
 
@@ -35,6 +43,17 @@ Two modes, decided by the user's phrasing:
 
 If the user's intent is ambiguous, default to validation mode and ask before iterating.
 
+## Config-driven project setup
+
+This skill is project-agnostic. All project-specific values (SSH host, container, repo path, conda env, compiler, benchmark suites, protected paths, branch/remote) live in a **config file** at `<project-root>/.perf-bench-loop/config.sh`.
+
+- Copy `config.example.sh` from this skill's repo to `.perf-bench-loop/config.sh` in the project root.
+- Fill in the values for your project.
+- The config is `source`d by `publish_candidate.sh`, `preflight.sh`, and `run_remote_asv.sh`.
+- **Do not commit `.perf-bench-loop/` to the project repo.** Add it to `.git/info/exclude` or the project's `.gitignore`.
+
+If `.perf-bench-loop/config.sh` is missing, the scripts will error out and tell you to create it.
+
 ## Workflow
 
 ### Phase 0 — Takeover check (run this first, every time)
@@ -44,225 +63,194 @@ Before doing anything else, check whether you're being asked to *continue* an in
 Symptoms that you're in a takeover situation:
 - The user says "continue", "继续", "接着做", "pick up where you left off", or refers to a run that's already started.
 - You already have context about a driver script you wrote earlier in the session (`run_focused_asv_*.sh`, a custom wrapper, etc.).
-- You already have a run directory path in context that you didn't create via `asv-background.sh`.
+- You already have a run directory path in context that you didn't create via this skill's scripts.
 - `AGENTS.md` in the project contains ASV-related instructions that predate this skill (e.g. "use a subagent to poll asv", "check the log every 60s").
 
-If any of these apply, do **not** silently continue the old workflow. That workflow was built without this skill's constraints and will keep burning tokens the way it already was. Instead:
+If any of these apply, do **not** silently continue the old workflow. Instead:
 
-1. **Surface the conflict to the user.** Say explicitly: "I see an in-flight ASV run / custom driver / conflicting AGENTS.md instruction from before the skill was installed. The skill's workflow is incompatible with continuing it as-is. Here are the options." Don't bury this.
+1. **Surface the conflict to the user.** Say explicitly: "I see an in-flight ASV run / custom driver / conflicting AGENTS.md instruction from before the skill was installed. The skill's workflow is incompatible with continuing it as-is. Here are the options."
 2. **Audit the existing run directory** (if one exists): does it have the four files this skill expects — `pid`, `run.log`, `exit_code`, `done`? Are they on the benchmark machine's filesystem (inside the container, if applicable), or only on the ssh host?
-    - If the run is already finished (`done` exists and `exit_code` is readable at the right layer): skip to Phase 5 with that run dir. Don't relaunch.
-    - If the run is still in flight but its files are at the wrong layer (e.g. `done` is inside a container but you'd check from the ssh host): you cannot monitor it with `wait-for-asv.sh`. Tell the user the old run can't be safely monitored by the skill, and ask whether to (a) wait for it manually, or (b) kill it and relaunch through the skill.
-    - If the run dir doesn't match the skill's layout at all (custom driver, no `done` marker): it cannot be monitored by the skill. Tell the user.
-3. **Check `AGENTS.md` for conflicting instructions.** If `AGENTS.md` tells you to poll, to use a subagent for monitoring, or to write your own ASV driver, those instructions predate and conflict with this skill. Do not follow both. Tell the user exactly which lines conflict and ask whether to update `AGENTS.md` to defer to this skill. (The skill's scripts are more reliable than ad-hoc AGENTS.md rules — they handle container layers, atomic `done` markers, and structured result parsing that hand-written rules usually get wrong.)
-4. Only after the conflict is resolved (user confirmed, AGENTS.md updated, old run either finished/killed/relaunched) should you proceed to Phase 1.
-
-The reason this phase exists: a skill loaded mid-session inherits an execution context that was built without it. The agent's momentum carries the old workflow forward and the new skill's instructions lose every collision. Forcing an explicit takeover check breaks that momentum.
+    - If the run is already finished (`done` exists and `exit_code` is readable): skip to Phase 5 with that run dir.
+    - If the run is still in flight but its files are at the wrong layer: tell the user the old run can't be safely monitored, and ask whether to (a) wait manually, or (b) kill it and relaunch through the skill.
+    - If the run dir doesn't match the skill's layout at all: tell the user.
+3. **Check `AGENTS.md` for conflicting instructions.** If it tells you to poll, to use a subagent for monitoring, or to write your own ASV driver, those instructions conflict with this skill. Tell the user which lines conflict and ask whether to update `AGENTS.md` to defer to this skill.
+4. Only after the conflict is resolved should you proceed to Phase 1.
 
 ### Phase 1 — Prepare
 
-Gather the following before touching anything. Don't guess any of it — every missing piece can waste an entire ASV run.
+Gather and verify before touching anything:
 
-1. **SSH host** — check in this order: (a) explicitly in the user's current message, (b) the project config file `.perf-bench-loop/host` (single line), (c) ask the user. Never invent a host.
-2. **Remote project root** — where the benchmark config lives on the benchmark machine (e.g. `asv.conf.json` for ASV). Ask if unclear.
-3. **Container or other hop (if any)** — does the benchmark run directly on the SSH host, or inside a container / another environment? If there's an intermediate hop (e.g. `docker exec <container>`), you need the full command chain that reaches the benchmark machine. Ask the user; don't assume.
-4. **Environment activation (if any)** — does the benchmark tool need a conda env, virtualenv, module load, or other activation before it's on PATH? If so, get the exact activation command. `docker exec` defaults to a non-login shell, so conda hooks won't load automatically — the activation command must be explicit.
-5. **Benchmark command** — the subcommand and flags. For ASV, e.g. `continuous --factor 1.05 <base> HEAD`, `run --branch=HEAD`. Ask the user every time. `asv-background.sh` currently prepends `asv` itself, so pass only the ASV subcommand and flags. **Do not use `--quick`** for runs whose results you want to compare — ASV does not save results from quick runs, so compare-asv.py will find nothing. Use `--quick` only for early smoke testing (does the benchmark even run without errors?).
-6. **Local test command** — what to run locally for the fast gate in Phase 2. Ask if not obvious from the project (`pytest -x` is a reasonable default for Python projects; never assume).
+1. **Config file** — check `<project-root>/.perf-bench-loop/config.sh` exists. If not, copy `config.example.sh` from this skill's repo and guide the user to fill it in. Verify `PBL_BRANCH`, `PBL_REMOTE`, `PBL_SSH_HOST`, `PBL_REMOTE_REPO`, `PBL_ASV_DIR`, `PBL_LOG_DIR` are non-empty.
+2. **Local test command** — what to run locally for the fast gate in Phase 2. Ask if not obvious from the project (`pytest -x` is a reasonable default for Python projects; never assume).
+3. **Suite or focused selector** — which benchmark suite to run. Either a named suite from config (`--suite owned`) or a focused selector (`--benchmark foo.bar`). Ask the user which.
 
-**First-run setup:** the skill's scripts need to be accessible on the benchmark machine. Deploy ALL of these to a **fixed location outside the project source tree** (e.g. `~/.local/share/perf-bench-loop/` or `/home/<user>/tools/perf-bench-loop/` on the benchmark machine):
-- `asv-background.sh` — launches ASV in background
-- `wait-for-asv.sh` — runs locally (your machine), reaches ASV machine via `--via`
-- `validate-asv-selection.py` — runs ON the benchmark machine (needs access to benchmarks.json)
-- `compare-asv.py` — runs locally on the results directory
-- `expected_cases.py` — shared module used by both validate and compare (must be in the same directory)
+**First-run setup:** the skill's scripts need to be accessible on both the local machine and the benchmark machine.
 
-`asv-background.sh` and `validate-asv-selection.py` run on the benchmark machine; `wait-for-asv.sh` and `compare-asv.py` run locally. Deploy all to the benchmark machine (for the first two) and keep locally (for the latter two). `expected_cases.py` must be alongside both `validate-asv-selection.py` and `compare-asv.py`.
+- **Local**: the scripts live in this skill's `scripts/` directory. If the skill is installed via the standard agentskills.io layout, they're at `<skill-dir>/scripts/`.
+- **Benchmark machine**: deploy ALL of these to a **fixed location outside the project source tree** (e.g. `~/.local/share/perf-bench-loop/` or `/home/<user>/tools/perf-bench-loop/`):
+  - `asv-background.sh`
+  - `wait-for-asv.sh`
+  - `probe-asv.sh`
+  - `compare-asv.py`
+  - `validate-asv-selection.py`
+  - `expected_cases.py`
 
-Run directories should also live outside the project tree (e.g. `/home/<user>/bench-runs/<timestamp>`), for the same reason.
+  `run_remote_asv.sh`, `preflight.sh`, and `publish_candidate.sh` run locally; the others run on the benchmark machine. `expected_cases.py` must be alongside both `validate-asv-selection.py` and `compare-asv.py`.
 
-**Line endings matter.** If you edit or copy these scripts on Windows, they may end up with CRLF (`\r\n`) line endings. Linux containers will fail with `env: 'bash\r': No such file or directory` — the `\r` breaks the shebang. After pushing to a Linux target, convert with `sed -i 's/\r$//'` on each script (run on the benchmark machine), or push via `scp` from a source that already has LF endings. Verify with `head -1 <script> | od -c | tail -1` — the line should end in `\n`, not `\r \n`.
+Run directories should also live outside the project tree (e.g. `/home/<user>/bench-runs/<timestamp>`).
 
-Optional: write `.perf-bench-loop/host` in the project root so future sessions skip step 1's question.
+**Line endings matter.** If you edit or copy these scripts on Windows, they may end up with CRLF (`\r\n`) line endings. Linux containers will fail with `env: 'bash\r': No such file or directory`. After pushing to a Linux target, convert with `sed -i 's/\r$//'` on each script. Verify with `head -1 <script> | od -c | tail -1`.
 
 ### Phase 2 — Implement and run the local fast gate
 
 Main agent work, high reasoning.
 
 1. Make the optimization the user asked for.
-2. Run the **local fast test** (from Phase 1, item 6) before any ASV involvement. This is seconds-to-minutes and catches the bulk of silly mistakes — a broken import, a wrong signature, a test that doesn't even pass functionally. ASV is hours-level; don't waste a server run on code that fails `pytest`.
-3. If the fast test fails, fix it and re-run. Do not proceed to Phase 3 until local tests are green.
+2. Run the **local fast test** (from Phase 1) before any ASV involvement. This is seconds-to-minutes and catches the bulk of silly mistakes. ASV is hours-level; don't waste a server run on code that fails locally.
+3. If the fast test fails, fix it and re-run. Do not proceed until local tests are green.
+4. **Publish project code** (if the change affects project source/tests): call `publish_candidate.sh` to commit, push, and align the remote validation mirror. This is the publication gate — it refuses protected paths, pre-staged changes, missing Git identity, stale branches, and force-pushes.
+
+   ```bash
+   scripts/publish_candidate.sh \
+       --message "PERF: describe the optimization" \
+       --path src/path/to/changed_file.py
+   ```
+
+   The helper sources `.perf-bench-loop/config.sh`, fetches the remote, stages only the explicit `--path` arguments, commits, pushes non-force, and aligns the remote mirror so its HEAD equals the candidate. It prints `CANDIDATE_READY=<sha>` on success.
+
+   If the project's `AGENTS.md` defines a standing authorization for publication, do not ask for confirmation. If not, ask the user before publishing.
 
 ### Phase 3 — Launch the remote ASV run
 
-Goal: start ASV in the background on the server and return immediately. Do not wait here.
+**Use `run_remote_asv.sh`.** Do not write your own driver script. This script orchestrates the full sequence: preflight → validate selectors → launch → wait → compare. One Bash call.
 
-**Critical: use `asv-background.sh` from this skill.** Do not write your own driver script. Every custom driver we've seen reintroduces the bugs this skill exists to prevent — wrong redirect target, missing `done` marker, log written to a layer the host can't read. The skill's script handles all of that. If it doesn't fit your setup, the right fix is a flag on the skill's script, not a new script.
+Two modes:
 
-**All validation must happen BEFORE launching ASV.** Do not start ASV and then discover the commit is wrong or a selector matches nothing. ASV shares its results directory across runs — a zero-matched selector leaves stale data that compare-asv.py would read as fresh results, producing a valid-looking but false comparison table.
-
-1. **Resolve baseline and candidate to full SHAs.** Run `git rev-parse <baseline>` and `git rev-parse <candidate>` (locally or on the remote). Record the full 40-char hashes — you'll need them for compare-asv.py later.
-2. **Verify the remote HEAD matches the candidate commit.** Run: `<exec-prefix> bash -lc "cd <remote-project-root> && git rev-parse HEAD"` and confirm it matches the candidate SHA from step 1. If it doesn't match, stop and tell the user — the remote needs to be updated (git fetch/checkout/pull) before running ASV.
-3. **Refresh or read benchmark metadata.** ASV stores benchmark metadata in `<results-dir>/benchmarks.json`. If it's stale (benchmarks were added/renamed since last run), refresh it with `asv run --bench just-discover` (NOT `asv check` — `asv check` does not save benchmarks.json). You need this file for selector validation.
-4. **Validate all selectors with `validate-asv-selection.py`.** This is mandatory before launching ASV. The validator runs ON THE BENCHMARK MACHINE (same filesystem layer as ASV) via the exec prefix. Use `--output-file` to write the expected-cases file to a path OUTSIDE the run directory (a sibling file), since `asv-background.sh` requires the run directory to be empty:
-
-   ```bash
-   <exec-prefix> bash -lc '<env-activation> && cd <remote-project-root> && \
-     <script-deploy-path>/validate-asv-selection.py \
-       --benchmarks-file <results-dir>/benchmarks.json \
-       --output-file <bench-runs-root>/<timestamp>.expected-cases.jsonl \
-       <asv-subcommand-and-flags-including-all-b-selectors>'
-   ```
-
-   This script checks EACH selector individually using ASV's exact matching semantics (expands parameter combinations, constructs `benchmark.name(param1, param2)` labels, applies `re.search`). If any selector matches zero cases or has invalid regex, it exits 1 and ASV must NOT be launched. It also strips trailing CR from selectors before matching. It writes `expected-cases.jsonl` (JSON Lines format), which compare-asv.py will use later to filter out stale data.
-
-   **Do NOT use `--quick`, `--dry-run`, `--skip-existing`, `--skip-existing-successful`, `--skip-existing-failed`, or `--skip-existing-commits`** for runs whose results you want to compare. These modes either don't save results or skip benchmarks, producing incomplete data that compare-asv.py cannot reliably validate.
-5. **Launch ASV** via the background script, using a FRESH EMPTY run directory (the validator's output file is a sibling, not inside the run directory):
-
-   ```bash
-   # Direct SSH
-   ssh <ssh-host> 'cd <remote-project-root> && <script-deploy-path>/asv-background.sh \
-     "<bench-runs-root>/<timestamp>" <asv-subcommand-and-flags...>'
-
-   # SSH + container + env activation
-   ssh <ssh-host> "docker exec <container> bash -lc \
-     '<env-activation> && cd <remote-project-root> && \
-      <script-deploy-path>/asv-background.sh <bench-runs-root>/<timestamp> \
-      <asv-subcommand-and-flags...>'"
-   ```
-
-   The `bash -lc` + env-activation wrapper is needed when the exec target (e.g. `docker exec`) defaults to a non-login shell that doesn't load env hooks. If there's no env activation, drop that wrapper and run the script directly.
-6. **Verify the launch took:** use the exec prefix to check the pid file exists within a few seconds. If not, the launch failed — do not proceed to waiting.
-7. **Record three things:** the run directory path (for Phase 4/5 `--run-dir`), the exec prefix for reaching the ASV machine's filesystem (for Phase 4 `--via` — without env activation), and the expected-cases.jsonl path (for Phase 5 `--expected-cases-file`).
-
-You're now done for this phase. The ASV run is running detached.
-
-### Phase 4 — Wait (this is where the tokens get saved)
-
-**Do not poll.** Do not run `ssh ... ps`. Do not run `ssh ... tail run.log` in a loop. Do not spawn a subagent "to check every 60 seconds." Every one of those is a high-reasoning forward pass burning tokens for no progress — and a polling subagent is worse, not better: it's still polling, just relocated.
-
-Instead, make one call to the wait script with the same `--via` prefix and `--run-dir` you recorded in Phase 3:
+**Standard mode** (default — no progress visibility):
 
 ```bash
-./scripts/wait-for-asv.sh \
-  --via '<exec-prefix-from-phase-3>' \
-  --run-dir '<run-dir-as-asv-machine-sees-it>' \
-  [--poll-interval 90] [--timeout 0]
+scripts/run_remote_asv.sh \
+    --baseline "$BASELINE" --candidate "$CANDIDATE" \
+    --suite owned
 ```
 
-Examples:
+This blocks until the comparison table is ready. One Bash call, regardless of whether ASV takes 5 minutes or 5 hours. The main agent spends zero tokens during the wait.
+
+**Probe mode** (progress visibility):
 
 ```bash
-# Direct SSH
-./scripts/wait-for-asv.sh --via 'ssh <ssh-host>' \
-  --run-dir '<remote-project-root>/bench-runs/<timestamp>'
-
-# SSH + container (note the -i, required for stdin/heredoc passthrough)
-./scripts/wait-for-asv.sh --via 'ssh <ssh-host> docker exec -i <container>' \
-  --run-dir '<remote-project-root>/bench-runs/<timestamp>'
+# Run in background so the main agent isn't blocked
+scripts/run_remote_asv.sh --probe \
+    --baseline "$BASELINE" --candidate "$CANDIDATE" \
+    --suite owned
 ```
 
-The `-i` on `docker exec` is not optional in the container case: `wait-for-asv.sh` feeds its wait-loop script via a heredoc on stdin, and without `-i` docker exec won't read stdin, so the loop never starts and the command hangs. Env activation (conda etc.) is not in `--via` because the wait loop only does `test`/`cat`/`tail` on files — no need for the ASV environment.
+This launches ASV and returns immediately, printing:
+- `RUN_DIR`: the remote run directory path
+- `VIA`: the exec prefix for reaching the ASV machine
+- `EXPECTED_CASES_FILE`: for the compare step later
+- `RESULTS_DIR`: for the compare step later
+- `BASELINE` / `CANDIDATE`: full SHAs
+- The exact `probe-asv.sh` and `compare-asv.py` commands to run later
 
-What this does: the exec prefix reaches the ASV machine, where a shell loop blocks on the `done` marker (and simultaneously checks pid liveness — if the wrapper process dies without writing `done`, it returns `STATE: wrapper-died` immediately instead of hanging forever). When `done` appears, it prints `RUN_DIR:` + the path and `EXIT_CODE:` + the ASV exit code. It does **not** print the log — the main agent uses `compare-asv.py` for structured results, or dispatches the monitor subagent if it needs the raw log. Returning 300 lines of log on every run would waste tokens.
+Store these. You'll use them in Phase 4 and Phase 5.
 
-The ASV exit code is passed through as-is. `asv continuous` exit codes mean:
-- `0` — no significant regression detected (may have improvements or no change).
-- `1` — at least one significant regression detected. This is a valid result; proceed to compare-asv.py for details.
-- `2` or other non-zero — benchmark/build/environment failure.
+**All validation happens BEFORE launching ASV.** `run_remote_asv.sh` calls `preflight.sh` (sync + env validation) and `validate-asv-selection.py` (selector validation) before launching ASV. If either fails, ASV is not started.
 
-The script's own exit codes are: 0 = run finished, 2 = run dir not found, 3 = timed out, 4 = wrapper died, 5 = transport failure or corrupt run state, 64 = usage error.
+### Phase 4 — Wait / Probe
 
-The `--via` redesign is deliberate. The previous version took a bare `SSH_HOST` and ran the wait loop on the ssh host's filesystem. In containerized setups (`ssh host docker exec container`) the `done` marker and `run.log` live *inside the container* and are invisible from the host — so the wait would either error out or hang forever. `--via` makes the hop chain explicit so every check runs at the right layer. If you find yourself wanting to "just check quickly with a raw ssh+tail," stop: that's the polling anti-pattern, and in a container setup it'll read the wrong layer anyway.
+**Standard mode**: you're already done. `run_remote_asv.sh` blocked in Phase 3 and returned the comparison table. Skip to Phase 5.
 
-This single step is the difference between the skill being worth it and not.
+**Probe mode**: ASV is running in the background on the remote. You need to poll progress. The frequency is up to you — use your judgment based on expected run duration. Short runs (~10 min): probe every ~1 min. Long runs (~hours): probe every ~5 min.
+
+- **ZCode**: call `probe-asv.sh` directly via Bash:
+
+  ```bash
+  scripts/probe-asv.sh \
+      --via 'ssh <host> docker exec -i <container>' \
+      --run-dir '<remote-run-dir>'
+  ```
+
+  Returns ≤20 lines: `STATE`, `ELAPSED`, `PID_ALIVE`, `LAST_LOG_LINE`, `EXIT_CODE`, `RUN_DIR`. Costs essentially nothing (Bash execution, no reasoning tokens).
+
+- **Codex**: dispatch the `asv_monitor` subagent (pinned to Terra/Luna). Pass the exec prefix and run dir. The subagent calls `probe-asv.sh` and returns a ≤100-word summary.
+
+**Do not poll more frequently than the run's progress warrants.** ASV progress doesn't change minute-by-minute on long runs. Every probe is a round-trip, even if it's cheap.
+
+When `probe-asv.sh` reports `STATE: done`, proceed to Phase 5.
 
 ### Phase 5 — Read the result
 
-**First, check Phase 4's own exit code** (not the ASV exit code printed inside the output):
+**Standard mode**: `run_remote_asv.sh` already printed the comparison table and returned an exit code. Check the exit code:
 
-- **4 (wrapper-died)**: The ASV process was killed before finishing (container restart, OOM, manual kill). The run produced no usable results. Dispatch the monitor subagent (see below) to read the partial log and diagnose, then decide whether to relaunch.
-- **3 (timed-out)**: The run exceeded `--timeout`. Either raise the timeout or investigate why ASV is stuck. Dispatch the monitor subagent to check the log tail.
-- **2 (run dir not found)**: Shouldn't happen if Phase 3 succeeded; re-verify the path and `--via`.
-- **0 (run finished)**: The ASV run completed. The printed ASV exit code tells you what kind of completion — see below.
+- `0` — all cases pass the policy. Report success.
+- `1` — ≥1 case violates the policy (regression or no improvement). Read the table. In iteration mode, analyze and loop back to Phase 2.
+- `2` — data incomplete or unreliable. Do NOT modify code. Diagnose: check if selectors were wrong, environment failed, or expected cases are missing.
+- `30` — preflight failed. Fix the environment, not the code.
+- `64` — config/argument error. Fix the arguments.
 
-**When Phase 4 returns 0 (run finished), the ASV exit code can be:**
-- `0` — no significant regression detected. May still have improvements or no change.
-- `1` — at least one significant regression detected. This is a valid result — proceed to compare-asv.py for the full picture.
-- `2` or other non-zero — ASV itself errored (environment failure, build failure, benchmark crash). This is a real failure; dispatch the monitor subagent.
-
-**Normal path (ASV exit 0 or 1): run compare-asv.py.**
-
-Always pass `--expected-cases-file` (from Phase 3 step 5) so the comparison only includes cases that were actually run this round — not stale data from the shared results file:
+**Probe mode**: when `probe-asv.sh` reports `STATE: done`, run `compare-asv.py` yourself using the command that Phase 3 printed:
 
 ```bash
-./scripts/compare-asv.py --results-dir <results-dir-on-asv-machine> \
-  --baseline <commit-hash> --candidate <commit-hash> \
-  --expected-cases-file <bench-runs-root>/<timestamp>.expected-cases.jsonl \
-  [--machine <name>] [--environment <env-name>] \
-  [--threshold 5] [--policy no-regression]
+scripts/compare-asv.py \
+    --results-dir '<results-dir>' \
+    --baseline <sha> --candidate <sha> \
+    --expected-cases-file '<expected-cases-file>' \
+    --threshold 5 --policy no-regression
 ```
 
-**Finding the results directory:** ASV stores results in the directory named by `results_dir` in `asv.conf.json` — often `results/` relative to the asv_bench directory, **not** `.asv/results/` (that's a common misconception). Check `asv.conf.json` if unsure. The results directory must be accessible from where you run compare-asv.py; if it's on the remote server, rsync it down or run the script over SSH.
+The exit codes are the same as standard mode (0/1/2).
 
-The script prints a markdown table with one row per parameter case (parameterized benchmarks are NOT merged — each parameter combination gets its own row):
-
-```
-| benchmark | baseline | candidate | ratio | status |
-|-----------|----------|-----------|-------|--------|
-| suite.foo(2, 'count') | 16.0 ms | 8.16 ms | 0.51 | IMPROVED ✅ |
-| suite.bar(4, 'var') | 46.3 ms | 32.4 ms | 0.70 | PASS ✅ |
-```
-
-Exit codes: `0` = data comparable, all cases pass the policy. `1` = data comparable, at least one case violates the policy (regression or no improvement). `2` = incomplete or unreliable — expected case missing, NOT_COMPARABLE/FAILED case, zero common cases, or ambiguous machine/env.
-
-**Phase 6 iteration rule:** only exit 1 from compare-asv.py allows entering the optimization iteration loop. Exit 2 means the data is incomplete or unreliable — do NOT modify code based on it; instead diagnose the problem (re-run, fix environment, fix selectors).
-
-**Failure path (ASV exit non-zero/non-one, or compare-asv.py returns 2, or wrapper-died):**
+**Failure path (ASV exit ≥2, wrapper-died, or compare returns 2):**
 
 Something went wrong — environment failure, ASV crash, missing baseline. The raw `run.log` may be long. **Do not read it directly.** Dispatch a low-model subagent:
 
-- Dispatch a **low-model subagent** (the whole point is to not burn high-reasoning tokens on log reading). The exact dispatch method depends on your host agent:
-    - **Codex**: spawn the `asv_monitor` custom agent defined in `.codex/agents/asv-monitor.toml` (if that file isn't in the project yet, copy it from `references/codex-setup.md` first). The toml already pins a lightweight model and read-only sandbox, so you don't specify those at dispatch time.
-    - **ZCode / Claude Code**: use the `Agent` tool with `model: "haiku"` and `subagent_type: "general-purpose"`.
-- Pass the prompt from `references/monitor-prompt.md`, filling in the exec prefix and run directory.
-- The subagent reads the log, classifies the failure, and returns a ≤200-word summary.
-- The main agent acts on the summary, never on the raw log.
+- **ZCode**: `Agent` tool with `model: "haiku"`, `subagent_type: "general-purpose"`.
+- **Codex**: spawn `asv_monitor` (the same toml covers both probe and failure-diagnosis — specify "TASK B: FAILURE DIAGNOSIS" in the prompt).
 
-This is the only place a subagent gets dispatched. For successful runs it never happens.
+Pass the prompt from `references/monitor-prompt.md`, filling in the exec prefix and run directory. The subagent reads the log, classifies the failure, and returns a ≤200-word summary. The main agent acts on the summary, never on the raw log.
 
 ### Phase 6 — Decide and (maybe) iterate
 
-Read the comparison table and exit code from compare-asv.py.
+Read the comparison table and exit code.
 
-- **Exit 0** (all cases pass the policy): report success to the user. Include the table. Stop. In iteration mode, this is also the success exit.
-- **Exit 1** (policy violation — regression or no improvement):
-  - In **validation mode**: report the regression with the table, suggest likely causes, stop. Don't modify code unless the user asks.
-  - In **iteration mode**: if iteration count < 3, analyze the table (which benchmarks regressed, by how much, how that maps to what you just changed), decide on a fix, go back to Phase 2. If iteration count == 3, stop and report — three failed attempts means the approach is probably wrong and a human should look.
-- **Exit 2** (incomplete or unreliable data): do NOT iterate or modify code. Diagnose the problem — check if selectors were wrong, environment failed, or expected cases are missing from the results. Re-run after fixing the root cause.
+- **Exit 0** (all cases pass): report success. Include the table. Stop. In iteration mode, this is the success exit.
+- **Exit 1** (policy violation):
+  - In **validation mode**: report the regression with the table, suggest likely causes, stop.
+  - In **iteration mode**: if iteration count < 3, analyze the table, decide on a fix, go back to Phase 2. If iteration count == 3, stop — three failed attempts means the approach is probably wrong.
+- **Exit 2** (incomplete data): do NOT iterate. Diagnose the problem — check selectors, environment, expected cases. Re-run after fixing the root cause.
 
 When reporting, always include: the comparison table, the run directory path, the path to the full log on the server, and (if iteration mode) which iteration this was out of 3.
 
+Read `references/coverage-discipline.md` for the generic methodology on coverage expansion, parameter-level rigor, threshold semantics, and reporting contracts. Project-specific benchmark scope belongs in the project's `AGENTS.md`.
+
 ## Common mistakes
 
-- **Continuing a pre-skill workflow after installing the skill mid-session.** If you were already running an ASV task with custom rules in `AGENTS.md` and the skill gets installed mid-flight, "continue" does not mean the skill takes over. Your existing context has a custom driver, a run dir at the wrong layer, and a polling habit — all of which will persist unless you explicitly run Phase 0 and break them. This is the #1 reason the skill appears to "not work" in Codex.
-- **Writing your own ASV driver script.** "I'll just write a small `run_focused_asv_*.sh`" is how every regression of this skill starts. Custom drivers reintroduce the exact bugs the skill's scripts fix: log redirected to the wrong layer, no atomic `done` marker, exit code lost. If the skill's script doesn't fit your case, add a flag to it — don't fork the concept.
-- **Polling the run from the main agent, or "delegating" polling to a subagent.** This is the anti-pattern the whole skill exists to kill. `sleep 60 && ssh ... tail` in a loop means every minute of a 3-hour run costs a forward pass. A subagent doing the same thing every 60s is *not* cheaper in the way that matters — it's still polling, and it still wakes the main agent to report. Use `wait-for-asv.sh`. One call, blocking, no subagent.
-- **Reading the raw ASV log from the main agent.** A full `asv run` log can be tens of thousands of lines. Loading it into the main agent's context is both expensive and unfocused. Use `compare-asv.py` for the structured answer, or dispatch a low-model subagent for failure diagnosis.
-- **Checking files at the wrong layer in a container setup.** If ASV runs in `ssh host docker exec container`, then `done`, `run.log`, `exit_code` all live *inside the container*. `ssh host cat /tmp/run.log` reads the host filesystem, not the container's — it'll be empty even though ASV ran fine. Always use the `--via` prefix that reaches the ASV machine, and `--run-dir` as the path inside that machine.
-- **Skipping the local fast gate.** ASV runs are hours. Local tests are seconds. Catching a typo at the local stage saves an entire wasted server run. Always run Phase 2.
-- **Guessing the SSH host or ASV command.** These vary per project and per run. Wrong host = connection failure, wrong command = wasted run. Ask.
-- **Treating `asv continuous` exit 1 as a failure.** `asv continuous` returns exit 1 when it detects at least one significant regression — that's a valid result. Only treat exit 2 or other non-zero codes as ASV failures.
-- **Retrying blindly on ASV failure.** A non-zero exit code (other than `asv continuous`'s 1) is usually an environment problem (missing dependency, conda env issue, disk full), not a code regression. Read the failure summary and fix the root cause before re-running. Re-running the same broken command 3 times just burns server time.
-- **Putting scripts or run directories inside the project source tree.** This pollutes `git status` and complicates PRs, especially for forks of upstream projects. Deploy scripts to a fixed path outside the repo (e.g. `~/.local/share/perf-bench-loop/`), and put run directories outside the repo too (e.g. `~/bench-runs/`).
-- **Skipping selector validation before launch.** If a `-b` selector has a typo, CR contamination, or references a renamed benchmark, ASV silently skips it (exit 0, zero benchmarks matched). The shared results file retains stale data from a previous run, and compare-asv.py reads that stale data as fresh — producing a valid-looking but false comparison table. Always run `validate-asv-selection.py` before launching ASV, and always pass `--expected-cases-file` to compare-asv.py.
+- **Continuing a pre-skill workflow after installing the skill mid-session.** Run Phase 0 first. If you were already running an ASV task with custom rules, "continue" does not mean the skill takes over.
+- **Writing your own ASV driver script.** Use `run_remote_asv.sh`. If it doesn't fit your case, add a flag to it — don't fork the concept.
+- **Polling the run from the main agent.** Use `probe-asv.sh` (probe mode) or let `run_remote_asv.sh` block (standard mode). One call, not a loop.
+- **Reading the raw ASV log from the main agent.** Use `compare-asv.py` for the structured answer, or dispatch a low-model subagent for failure diagnosis.
+- **Checking files at the wrong layer in a container setup.** If ASV runs in `ssh host docker exec container`, then `done`, `run.log`, `exit_code` all live *inside the container*. Always use the `--via` prefix that reaches the ASV machine.
+- **Skipping the local fast gate.** ASV runs are hours. Local tests are seconds. Always run Phase 2.
+- **Guessing the config values.** Wrong host = connection failure, wrong suite = wasted run. Read `.perf-bench-loop/config.sh`.
+- **Treating `asv continuous` exit 1 as a failure.** Exit 1 means a regression was detected — that's a valid result. Only exit ≥2 is an ASV failure.
+- **Retrying blindly on ASV failure.** A non-zero exit (other than 1) is usually an environment problem, not a code regression. Read the failure summary and fix the root cause.
+- **Putting scripts or run directories inside the project source tree.** Deploy scripts to a fixed path outside the repo, and put run directories outside the repo too.
+- **Skipping selector validation before launch.** `run_remote_asv.sh` does this automatically via `validate-asv-selection.py`. If you're launching ASV manually (bypassing `run_remote_asv.sh`), always run the validator first.
+- **Committing `.perf-bench-loop/config.sh` to the project repo.** It contains project-specific paths and may contain sensitive host info. Add to `.git/info/exclude` or `.gitignore`.
 
 ## References
 
-- `[monitor-prompt.md](references/monitor-prompt.md)` — load this when dispatching the low-model subagent in Phase 5's failure branch. It's the prompt template.
-- `[codex-setup.md](references/codex-setup.md)` — load this on first use in Codex. It contains the `.codex/agents/asv-monitor.toml` file to drop into the project so the low-model monitor subagent has a pinned lightweight model and read-only sandbox. ZCode/Claude Code users can ignore this file.
-- `scripts/asv-background.sh` — run with no args to see usage. Deploy to a fixed path on the benchmark machine.
-- `scripts/wait-for-asv.sh` — run with no args to see usage. Runs locally; reaches the ASV machine via `--via`.
-- `scripts/compare-asv.py` — run with `--help` for full options. Runs locally on the results directory (rsync it down or run over SSH). Pass `--expected-cases-file` to filter out stale data.
-- `scripts/validate-asv-selection.py` — run before launching ASV (ON the benchmark machine). Validates each `-b` selector individually and writes `expected-cases.jsonl`. Run with `--help` for options.
-- `scripts/expected_cases.py` — shared module for reading/writing expected-cases JSONL. Not run directly.
+- `[coverage-discipline.md](references/coverage-discipline.md)` — generic ASV validation methodology: coverage expansion order, parameter-level rigor, threshold semantics, specialization safety, reporting contract.
+- `[monitor-prompt.md](references/monitor-prompt.md)` — prompt template for the low-model failure-diagnosis subagent (Phase 5 failure branch).
+- `[codex-setup.md](references/codex-setup.md)` — `.codex/agents/asv-monitor.toml` for Codex. Pins a lightweight model (Terra/Luna) and read-only sandbox. Covers both probe and failure-diagnosis tasks.
+- `scripts/run_remote_asv.sh` — unified orchestration: preflight → validate → launch → wait → compare. Run with `--help` for usage.
+- `scripts/publish_candidate.sh` — config-driven publication gate: commit, push, align remote mirror. Run with `--help` for usage.
+- `scripts/preflight.sh` — config-driven remote environment validation. Run standalone or called by `run_remote_asv.sh`.
+- `scripts/probe-asv.sh` — single-snapshot progress check. Returns immediately with STATE/ELAPSED/LAST_LOG_LINE.
+- `scripts/asv-background.sh` — launch ASV in background, write status files. Deploy to benchmark machine.
+- `scripts/wait-for-asv.sh` — block on `done` marker (the token saver). Runs locally via `--via`.
+- `scripts/compare-asv.py` — parse ASV results, emit markdown comparison table. Run with `--help` for options.
+- `scripts/validate-asv-selection.py` — pre-check `-b` selectors, write expected-cases JSONL. Run on benchmark machine.
+- `scripts/expected_cases.py` — shared JSONL read/write module. Not run directly.
+- `config.example.sh` — template for `.perf-bench-loop/config.sh`. Copy and fill in project values.

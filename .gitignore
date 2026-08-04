@@ -1,3 +1,7 @@
 
 # Test artifacts (Windows temp paths accidentally created by tests)
 C:/
+
+# Python cache
+__pycache__/
+*.pyc
