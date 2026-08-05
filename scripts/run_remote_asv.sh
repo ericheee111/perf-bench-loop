@@ -165,7 +165,7 @@ wait_script="$script_dir/wait-for-asv.sh"
 # ── Helper: find remote script dir ─────────────────────────────────────
 # Returns the remote directory where perf-bench-loop scripts are deployed.
 remote_script_dir() {
-    "${exec_prefix_args[@]}" bash -c '
+    "${exec_prefix_args[@]}" bash -s <<'REMOTE_FIND'
         for d in "$HOME/.local/share/perf-bench-loop" "$HOME/tools/perf-bench-loop" /opt/perf-bench-loop; do
             if [ -f "$d/asv-background.sh" ] && [ -f "$d/compare-asv.py" ]; then
                 printf "%s\n" "$d"
@@ -173,7 +173,7 @@ remote_script_dir() {
             fi
         done
         exit 1
-    '
+REMOTE_FIND
 }
 
 # ── Step 1: Preflight ──────────────────────────────────────────────────
@@ -197,8 +197,12 @@ printf 'STEP: resolve START\n'
 
 # Resolve baseline/candidate to full SHAs on the remote, and find results_dir.
 # Single round-trip: one SSH call captures both.
+# Use printf %q for safe SSH argv serialization.
+printf -v resolve_cmd '%q ' bash -s -- "$repo" "$asv_dir" "$baseline" "$candidate"
+resolve_cmd=${resolve_cmd% }
+
 set +e
-remote_info=$("${exec_prefix_args[@]}" bash -s -- "$repo" "$asv_dir" "$baseline" "$candidate" <<'REMOTE_RESOLVE'
+remote_info=$("${exec_prefix_args[@]}" "$resolve_cmd" <<'REMOTE_RESOLVE'
 set -euo pipefail
 repo="$1"; asv_dir="$2"; baseline="$3"; candidate="$4"
 
@@ -268,18 +272,18 @@ for b in "${benchmarks[@]}"; do
 done
 
 bench_runs_root="$log_dir/bench-runs"
-run_dir="$bench_runs_root/$(date +%Y%m%d_%H%M%S)"
-expected_cases_file="$bench_runs_root/$(date +%Y%m%d_%H%M%S).expected-cases.jsonl"
-
-# Note: expected_cases_file timestamp is generated separately from run_dir.
-# They should match. Fix: generate timestamp once.
 timestamp=$(date +%Y%m%d_%H%M%S)
 run_dir="$bench_runs_root/${timestamp}"
 expected_cases_file="$bench_runs_root/${timestamp}.expected-cases.jsonl"
 
+# Use printf %q to safely pass args through SSH argv serialization.
+printf -v validate_cmd '%q ' \
+    bash -s -- \
+    "$rscript_dir" "$results_dir" "$expected_cases_file" "$asv_args_str"
+validate_cmd=${validate_cmd% }
+
 set +e
-"${exec_prefix_args[@]}" bash -s -- \
-    "$rscript_dir" "$results_dir" "$expected_cases_file" "$asv_args_str" <<'REMOTE_VALIDATE'
+"${exec_prefix_args[@]}" "$validate_cmd" <<'REMOTE_VALIDATE'
 set -euo pipefail
 rscript_dir="$1"; results_dir="$2"; expected_cases_file="$3"; asv_args_str="$4"
 
@@ -311,9 +315,13 @@ printf 'expected_cases_file=%s\n' "$expected_cases_file"
 printf 'STEP: launch START\n'
 
 # Create run directory on remote (must be empty for asv-background.sh).
-"${exec_prefix_args[@]}" bash -c "mkdir -p '$run_dir'"
+"${exec_prefix_args[@]}" bash -s -- "$run_dir" <<'REMOTE_MKDIR'
+mkdir -p "$1"
+REMOTE_MKDIR
 set +e
-"${exec_prefix_args[@]}" bash -c "[ -z \"\$(ls -A '$run_dir' 2>/dev/null)\" ]"
+"${exec_prefix_args[@]}" bash -s -- "$run_dir" <<'REMOTE_CHECK_EMPTY'
+[ -z "$(ls -A "$1" 2>/dev/null)" ]
+REMOTE_CHECK_EMPTY
 empty_rc=$?
 set -e
 if [ "$empty_rc" -ne 0 ]; then
@@ -334,20 +342,60 @@ for exp in "${PBL_ENV_EXPORTS[@]:-}"; do
 done
 
 # Build ASV command args for asv-background.sh (it prepends `asv`).
-# Using printf %q for safe quoting.
-asv_cmd_quoted=$(printf '%q ' continuous --factor "$factor" "$baseline" "$candidate")
+# We pass them as positional args to avoid quoting issues through SSH.
+asv_cmd_args=(continuous --factor "$factor" "$baseline" "$candidate")
 for b in "${benchmarks[@]}"; do
-    asv_cmd_quoted+=$(printf '%q ' -b "$b")
+    asv_cmd_args+=(-b "$b")
 done
-asv_cmd_quoted=${asv_cmd_quoted% }
+
+# Join env exports with ',' (survives printf %q + SSH, unlike spaces).
+env_exports_str="${PBL_ENV_EXPORTS[*]:-}"
+env_exports_str="${env_exports_str// /,}"
 
 # Launch via remote asv-background.sh, with env activation wrapper.
+# All parameters passed as positional args to avoid SSH quoting issues.
+# Build printf %q-escaped command string for the remote bash.
+printf -v launch_cmd '%q ' \
+    bash -s -- \
+    "$asv_dir" "$rscript_dir" "$run_dir" \
+    "${PBL_CONDA_EXE:-}" "${PBL_CONDA_ENV:-}" \
+    "${PBL_TOOLCHAIN_ENABLE:-}" \
+    "$env_exports_str" \
+    "${asv_cmd_args[@]}"
+launch_cmd=${launch_cmd% }
+
 set +e
-"${exec_prefix_args[@]}" bash -c "
-    cd '$asv_dir' && \
-    $env_activation \
-    bash '$rscript_dir/asv-background.sh' '$run_dir' $asv_cmd_quoted
-"
+"${exec_prefix_args[@]}" "$launch_cmd" <<'REMOTE_LAUNCH'
+set -euo pipefail
+asv_dir="$1"; shift
+rscript_dir="$1"; shift
+run_dir="$1"; shift
+conda_exe="$1"; shift
+conda_env="$1"; shift
+toolchain_enable="$1"; shift
+env_exports_str="$1"; shift
+# Remaining args are the ASV subcommand + flags.
+
+# Activate env (ephemeral).
+if [ -n "$conda_exe" ]; then
+    conda_base=$("$conda_exe" info --base 2>/dev/null)
+    source "$conda_base/etc/profile.d/conda.sh"
+    conda activate "$conda_env"
+fi
+if [ -n "$toolchain_enable" ]; then
+    source "$toolchain_enable"
+fi
+# Export env vars (comma-separated, split safely).
+if [ -n "$env_exports_str" ]; then
+    IFS=',' read -ra env_exports <<< "$env_exports_str"
+    for exp in "${env_exports[@]}"; do
+        export "$exp"
+    done
+fi
+
+cd "$asv_dir"
+bash "$rscript_dir/asv-background.sh" "$run_dir" "$@"
+REMOTE_LAUNCH
 launch_rc=$?
 set -e
 
@@ -402,7 +450,12 @@ fi
 
 # Read ASV exit code from the remote.
 set +e
-asv_exit=$("${exec_prefix_args[@]}" bash -c "cat '$run_dir/exit_code' 2>/dev/null")
+printf -v read_cmd '%q ' bash -s -- "$run_dir"
+read_cmd=${read_cmd% }
+asv_exit=$("${exec_prefix_args[@]}" "$read_cmd" <<'REMOTE_READ'
+cat "$1/exit_code" 2>/dev/null
+REMOTE_READ
+)
 read_rc=$?
 set -e
 
@@ -425,17 +478,32 @@ fi
 printf 'STEP: compare START\n'
 
 # Run compare-asv.py on the remote (it needs access to the results dir).
+printf -v compare_cmd '%q ' \
+    bash -s -- \
+    "$rscript_dir" "$results_dir" "$baseline_sha" "$candidate_sha" \
+    "$expected_cases_file" "$threshold" "$policy"
+compare_cmd=${compare_cmd% }
+
 set +e
-"${exec_prefix_args[@]}" bash -c "
-    cd '$rscript_dir' && \
-    python3 ./compare-asv.py \
-        --results-dir '$results_dir' \
-        --baseline '$baseline_sha' \
-        --candidate '$candidate_sha' \
-        --expected-cases-file '$expected_cases_file' \
-        --threshold '$threshold' \
-        --policy '$policy'
-"
+"${exec_prefix_args[@]}" "$compare_cmd" <<'REMOTE_COMPARE'
+set -euo pipefail
+rscript_dir="$1"; shift
+results_dir="$1"; shift
+baseline="$1"; shift
+candidate="$1"; shift
+expected_cases_file="$1"; shift
+threshold="$1"; shift
+policy="$1"; shift
+
+cd "$rscript_dir"
+python3 ./compare-asv.py \
+    --results-dir "$results_dir" \
+    --baseline "$baseline" \
+    --candidate "$candidate" \
+    --expected-cases-file "$expected_cases_file" \
+    --threshold "$threshold" \
+    --policy "$policy"
+REMOTE_COMPARE
 compare_rc=$?
 set -e
 
