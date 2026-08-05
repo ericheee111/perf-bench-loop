@@ -280,10 +280,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="ASV command args to parse for -b/--bench selectors. "
                         "Pass them after '--' so argparse treats -b values as "
                         "positional args, not unknown options.")
-    # Use parse_args (not parse_known_args) so unexpected options error
-    # instead of being silently dropped. The '--' separator ensures
-    # everything after it lands in asv_args as positional args.
-    args = p.parse_args(argv)
+    # Use parse_known_args so -b values work with or without '--' separator.
+    # CRITICAL: do NOT overwrite args.asv_args with the 'unknown' return value
+    # (the second element). That was the original bug — it replaced the
+    # correctly-parsed positional args (which contain -b selectors after --)
+    # with the unknown-args list (which was empty), causing the validator to
+    # fall back to "all benchmarks expected" and write 11000+ cases.
+    # The positional asv_args already contains everything after '--'; the
+    # unknown list is only for diagnostics and is discarded.
+    args, _unknown = p.parse_known_args(argv)
     return args
 
 
