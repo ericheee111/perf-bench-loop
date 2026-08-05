@@ -277,9 +277,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "run directory (sibling file) to avoid conflict with "
                         "asv-background.sh's empty-directory requirement.")
     p.add_argument("asv_args", nargs="*",
-                   help="ASV command args to parse for -b/--bench selectors.")
-    args, asv_args = p.parse_known_args(argv)
-    args.asv_args = asv_args
+                   help="ASV command args to parse for -b/--bench selectors. "
+                        "Pass them after '--' so argparse treats -b values as "
+                        "positional args, not unknown options.")
+    # Use parse_args (not parse_known_args) so unexpected options error
+    # instead of being silently dropped. The '--' separator ensures
+    # everything after it lands in asv_args as positional args.
+    args = p.parse_args(argv)
     return args
 
 

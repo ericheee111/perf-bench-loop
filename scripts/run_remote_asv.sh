@@ -264,11 +264,12 @@ printf 'remote_script_dir=%s\n' "$rscript_dir"
 # ── Step 4: Validate selectors ─────────────────────────────────────────
 printf 'STEP: validate_selectors START\n'
 
-# Run validate-asv-selection.py on the remote.
-# Build the ASV args string for the validator (it parses -b selectors).
-asv_args_str="continuous --factor $factor $baseline $candidate"
+# Build the ASV args as an array so each -b selector is a separate argv
+# element. Passing them as a single space-joined string would break under
+# printf %q (escaped spaces prevent word-splitting on the remote).
+asv_cmd_args=(continuous --factor "$factor" "$baseline" "$candidate")
 for b in "${benchmarks[@]}"; do
-    asv_args_str+=" -b $b"
+    asv_cmd_args+=(-b "$b")
 done
 
 bench_runs_root="$log_dir/bench-runs"
@@ -276,16 +277,19 @@ timestamp=$(date +%Y%m%d_%H%M%S)
 run_dir="$bench_runs_root/${timestamp}"
 expected_cases_file="$bench_runs_root/${timestamp}.expected-cases.jsonl"
 
-# Use printf %q to safely pass args through SSH argv serialization.
+# Pass each ASV arg as a separate positional parameter. The remote script
+# collects them via "$@" after the first 3 fixed args.
 printf -v validate_cmd '%q ' \
     bash -s -- \
-    "$rscript_dir" "$results_dir" "$expected_cases_file" "$asv_args_str"
+    "$rscript_dir" "$results_dir" "$expected_cases_file" \
+    "${asv_cmd_args[@]}"
 validate_cmd=${validate_cmd% }
 
 set +e
 "${exec_prefix_args[@]}" "$validate_cmd" <<'REMOTE_VALIDATE'
 set -euo pipefail
-rscript_dir="$1"; results_dir="$2"; expected_cases_file="$3"; asv_args_str="$4"
+rscript_dir="$1"; results_dir="$2"; expected_cases_file="$3"; shift 3
+# Remaining args ($@) are the ASV subcommand + flags (continuous --factor ... -b sel ...).
 
 bj="$results_dir/benchmarks.json"
 if [ ! -f "$bj" ]; then
@@ -295,11 +299,12 @@ if [ ! -f "$bj" ]; then
 fi
 
 # Run the validator. It imports expected_cases.py from its own directory.
+# Pass ASV args via "$@" so -b selectors are parsed correctly.
 cd "$rscript_dir"
 python3 ./validate-asv-selection.py \
     --benchmarks-file "$bj" \
     --output-file "$expected_cases_file" \
-    -- $asv_args_str
+    -- "$@"
 REMOTE_VALIDATE
 validate_rc=$?
 set -e
