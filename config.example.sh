@@ -36,11 +36,45 @@ PBL_PROTECTED_PATHS=(
 # exec prefix becomes "ssh $PBL_SSH_HOST docker exec -i $PBL_CONTAINER".
 # If empty, it is just "ssh $PBL_SSH_HOST".
 
-PBL_SSH_HOST="kpserver"                       # [required] SSH host
+PBL_SSH_HOST="kpserver"                       # [required] SSH host (default server)
 PBL_CONTAINER="ericheee-cpu200-203"           # [optional] Docker container name
 PBL_REMOTE_REPO="/home/user/project"          # [required] repo path on the benchmark machine
 PBL_ASV_DIR="/home/user/project/asv_bench"    # [required] ASV directory on the benchmark machine
 PBL_LOG_DIR="/home/user/asv-logs"             # [required] log directory OUTSIDE the repo
+
+# ── Multiple benchmark servers (optional) ─────────────────────────────
+# For parallel validation across multiple machines, define PBL_SERVERS as
+# a list of names, then define a PBL_SERVER_<NAME>_* block for each.
+# run_remote_asv.sh --server <NAME> overrides the PBL_* fields above with
+# the matching PBL_SERVER_<NAME>_* values.
+#
+# If PBL_SERVERS is empty or --server is not passed, the PBL_* fields
+# above are used (single-server mode, fully backward-compatible).
+#
+# Example:
+# PBL_SERVERS=(kp920b kp950)
+#
+# PBL_SERVER_kp920b_SSH_HOST="kpserver"
+# PBL_SERVER_kp920b_CONTAINER="ericheee-cpu200-203"
+# PBL_SERVER_kp920b_REMOTE_REPO="/home/h00932740/pandas"
+# PBL_SERVER_kp920b_ASV_DIR="/home/h00932740/pandas/asv_bench"
+# PBL_SERVER_kp920b_LOG_DIR="/home/h00932740/asv-logs"
+# PBL_SERVER_kp920b_CONDA_EXE="/opt/miniforge3/bin/conda"
+# PBL_SERVER_kp920b_CONDA_ENV="h00932740"
+# PBL_SERVER_kp920b_TOOLCHAIN_ENABLE="/opt/rh/gcc-toolset-12/enable"
+# PBL_SERVER_kp920b_EXPECTED_GCC_MAJOR="12"
+# PBL_SERVER_kp920b_EXPECTED_ARCH="aarch64"
+#
+# PBL_SERVER_kp950_SSH_HOST="kp950host"
+# PBL_SERVER_kp950_CONTAINER=""
+# PBL_SERVER_kp950_REMOTE_REPO="/home/user/pandas"
+# ... (same fields, different values)
+#
+# Fields that are the same across servers (e.g. PBL_ENV_EXPORTS,
+# PBL_REQUIRED_TOOLS) are shared — only connection/path/env-specific
+# fields go in PBL_SERVER_<NAME>_*.
+
+PBL_SERVERS=()                                 # [optional] list of server names for parallel validation
 
 # ── Environment activation ─────────────────────────────────────────────
 # All activation is ephemeral (sourced inside one SSH command, never written

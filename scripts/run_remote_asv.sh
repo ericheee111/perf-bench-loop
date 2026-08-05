@@ -20,6 +20,8 @@
 # Options:
 #   --benchmark SEL     Focused ASV selector; repeatable, appended to suite
 #   --factor NUMBER     ASV comparison factor (overrides config PBL_FACTOR)
+#   --server NAME       Override default server with PBL_SERVER_<NAME>_* block
+#                       from config (for parallel validation across machines)
 #   --no-sync           Skip mirror synchronization (historical diagnostics)
 #   --probe             Launch and return immediately; agent polls with
 #                       probe-asv.sh and runs compare-asv.py when done
@@ -44,6 +46,7 @@ baseline=""
 candidate=""
 suite=""
 factor_override=""
+server_name=""
 sync_remote=1
 probe_mode=0
 dry_run=0
@@ -69,6 +72,7 @@ while [ "$#" -gt 0 ]; do
         --suite)     need_value "$@"; suite="$2"; shift 2 ;;
         --benchmark) need_value "$@"; custom_benchmarks+=("$2"); shift 2 ;;
         --factor)    need_value "$@"; factor_override="$2"; shift 2 ;;
+        --server)    need_value "$@"; server_name="$2"; shift 2 ;;
         --no-sync)   sync_remote=0; shift ;;
         --probe)     probe_mode=1; shift ;;
         --dry-run)   dry_run=1; shift ;;
@@ -101,6 +105,32 @@ source "$config_file"
 [ -n "${PBL_FACTOR:-}" ] || die "config PBL_FACTOR is empty"
 
 [ "${PBL_SYNC_REMOTE:-1}" == "0" ] && sync_remote=0
+
+# ── Override with named server if --server was passed ──────────────────
+# When --server NAME is given, override the PBL_* connection/path/env
+# fields with PBL_SERVER_<NAME>_* values from config. This enables
+# parallel validation across multiple machines — the main agent calls
+# run_remote_asv.sh once per server with different --server values.
+if [ -n "$server_name" ]; then
+    prefix="PBL_SERVER_${server_name}"
+    # Verify the server block exists by checking SSH_HOST (required).
+    ssh_host_var="${prefix}_SSH_HOST"
+    if [ -z "${!ssh_host_var:-}" ]; then
+        die "server '$server_name' not found in config: expected ${prefix}_SSH_HOST"
+    fi
+    # Override each field if the server-specific version is set.
+    # Use indirect expansion: ${!var} reads the value of the variable whose
+    # name is stored in $var.
+    for field in SSH_HOST CONTAINER REMOTE_REPO ASV_DIR LOG_DIR \
+                 CONDA_EXE CONDA_ENV TOOLCHAIN_ENABLE \
+                 EXPECTED_GCC_MAJOR EXPECTED_ARCH; do
+        var="${prefix}_${field}"
+        if [ -n "${!var:-}" ]; then
+            export "PBL_${field}=${!var}"
+        fi
+    done
+    printf 'server_override=%s\n' "$server_name"
+fi
 
 # ── Resolve suite selectors ────────────────────────────────────────────
 benchmarks=()
