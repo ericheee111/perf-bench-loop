@@ -241,7 +241,7 @@ fail() {
 
 [ -d "$remote_repo" ] || fail "repository directory missing: $remote_repo"
 git -C "$remote_repo" rev-parse --git-dir >/dev/null 2>&1 || fail "not a Git repository"
-[ -z "$(git -C "$remote_repo" status --porcelain)" ] || fail "test repository is dirty"
+[ -z "$(git -C "$remote_repo" status --porcelain | grep -v '^??' || true)" ] || fail "test repository is dirty (tracked files modified)"
 git -C "$remote_repo" remote get-url "$remote_name" >/dev/null 2>&1 || fail "remote unavailable: $remote_name"
 
 git -C "$remote_repo" fetch --prune "$remote_name" || fail "git fetch failed"
@@ -283,7 +283,7 @@ git -C "$remote_repo" pull --ff-only "$remote_name" "$branch" || \
 
 head=$(git -C "$remote_repo" rev-parse HEAD)
 [ "$head" == "$candidate" ] || fail "pulled HEAD ($head) does not equal candidate ($candidate)"
-[ -z "$(git -C "$remote_repo" status --porcelain)" ] || fail "test repository became dirty"
+[ -z "$(git -C "$remote_repo" status --porcelain | grep -v '^??' || true)" ] || fail "test repository became dirty (tracked files modified)"
 printf 'REMOTE_PULL_COMPLETE remote=%s branch=%s candidate=%s\n' "$remote_name" "$branch" "$candidate"
 REMOTE_CONTAINER
 REMOTE_HOST

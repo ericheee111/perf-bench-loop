@@ -117,20 +117,31 @@ command -v ssh >/dev/null 2>&1 || die "ssh executable not found"
 
 # ── Run remote preflight ───────────────────────────────────────────────
 # Config values are passed as positional argv to the remote bash script.
-# Arrays (PBL_ENV_EXPORTS, PBL_REQUIRED_TOOLS) are joined as strings and
-# re-split on the remote side.
+# Arrays (PBL_ENV_EXPORTS, PBL_REQUIRED_TOOLS) are joined with ',' (not
+# spaces or ';') so they survive SSH argv serialization without word-
+# splitting. printf %q does not escape ',', making it safe end-to-end.
 env_exports_str="${PBL_ENV_EXPORTS[*]:-}"
+env_exports_str="${env_exports_str// /,}"
 required_tools_str="${PBL_REQUIRED_TOOLS[*]:-}"
+required_tools_str="${required_tools_str// /,}"
 
 set +e
-"${exec_prefix_args[@]}" bash -s -- \
+# Build the remote command with printf %q so every argument is shell-escaped.
+# This is critical for arguments containing '=' (like env exports) — SSH
+# would otherwise treat "VAR=value" as an env-var assignment instead of a
+# positional parameter.
+printf -v remote_cmd '%q ' \
+    bash -s -- \
     "$repo" "$asv_dir" "$log_dir" \
     "${PBL_CONDA_EXE:-}" "${PBL_CONDA_ENV:-}" \
     "${PBL_TOOLCHAIN_ENABLE:-}" \
     "${PBL_EXPECTED_GCC_MAJOR:-}" "${PBL_EXPECTED_ARCH:-}" \
     "$env_exports_str" "$required_tools_str" \
     "$remote_name" "$branch" "$sync_remote" \
-    "$baseline" "$candidate" <<'REMOTE'
+    "$baseline" "$candidate"
+remote_cmd=${remote_cmd% }
+
+"${exec_prefix_args[@]}" "$remote_cmd" <<'REMOTE'
 set -euo pipefail
 
 repo=$1; shift
@@ -149,11 +160,11 @@ sync_remote=$1; shift
 baseline=$1; shift
 candidate=$1; shift
 
-# Re-split space-joined arrays.
+# Re-split ','-joined arrays (separator chosen to survive printf %q + SSH).
 env_exports=()
-[ -n "$env_exports_str" ] && read -ra env_exports <<< "$env_exports_str"
+[ -n "$env_exports_str" ] && IFS=',' read -ra env_exports <<< "$env_exports_str"
 required_tools=()
-[ -n "$required_tools_str" ] && read -ra required_tools <<< "$required_tools_str"
+[ -n "$required_tools_str" ] && IFS=',' read -ra required_tools <<< "$required_tools_str"
 
 fail() {
     printf 'PREFLIGHT_FAIL: %s\n' "$*" >&2
@@ -173,7 +184,12 @@ pass "ASV directory"
 
 # ── Mirror synchronization ─────────────────────────────────────────────
 if [ "$sync_remote" == "1" ]; then
-    status_before=$(git -C "$repo" status --porcelain)
+    # Check for tracked-file modifications only. Untracked files (??) are
+    # allowed — they don't interfere with git switch/pull and may be
+    # project-local helper scripts the user keeps in the validation mirror.
+    # `|| true` prevents set -e from exiting when grep finds no matches
+    # (i.e. all files are untracked, which is the clean case).
+    status_before=$(git -C "$repo" status --porcelain | grep -v '^??' || true)
     [ -z "$status_before" ] || fail "test repository is dirty; refusing fetch/switch/pull"
     git -C "$repo" remote get-url "$remote_name" >/dev/null 2>&1 || \
         fail "Git remote unavailable: $remote_name"
@@ -230,7 +246,7 @@ if [ "$sync_remote" == "1" ]; then
     candidate_commit=$(git -C "$repo" rev-parse "${candidate}^{commit}")
     [ "$pulled_head" == "$candidate_commit" ] || \
         fail "pulled $branch HEAD ($pulled_head) does not equal candidate ($candidate_commit)"
-    [ -z "$(git -C "$repo" status --porcelain)" ] || \
+    [ -z "$(git -C "$repo" status --porcelain | grep -v '^??' || true)" ] || \
         fail "test repository became dirty after synchronization"
     pass "test repository HEAD equals candidate"
 fi
